@@ -5,11 +5,20 @@ from datetime import timezone
 from pathlib import Path
 from typing import Optional
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import FSInputFile, Message
 from telethon import TelegramClient
-from telethon.errors import FloodWaitError
+from telethon.errors import (
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    PhoneNumberInvalidError,
+    SessionPasswordNeededError,
+)
 from telethon.tl.types import MessageService
 
 
@@ -21,16 +30,11 @@ API_ID = 32200104
 API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
 BOT_TOKEN = "8498016557:AAFwjnX1Zcp96e1PCWVvmFplpmdEVUJMNZg"
 
-# Telegram ID администратора, которому разрешено использовать бота
+# Telegram ID администратора
 ADMIN_ID = 7517164478
 
-# Имя файла пользовательской Telegram-сессии
 SESSION_NAME = "telegram_user"
-
-# Папка для временных TXT-файлов
 EXPORT_DIR = Path("exports")
-
-# Максимальный размер одной части файла
 MAX_PART_SIZE = 45 * 1024 * 1024
 
 
@@ -48,6 +52,18 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 router = Router()
 export_locks: dict[int, asyncio.Lock] = {}
+
+telegram_client = TelegramClient(
+    SESSION_NAME,
+    API_ID,
+    API_HASH,
+)
+
+
+class LoginStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
 
 def is_allowed(user_id: int) -> bool:
@@ -96,18 +112,18 @@ async def sender_name(message) -> str:
     return name or str(sender_id or "Неизвестно")
 
 
-async def resolve_entity(client: TelegramClient, target: str):
+async def resolve_entity(target: str):
     target = target.strip()
 
     if re.fullmatch(r"-?\d+", target):
-        return await client.get_entity(int(target))
+        return await telegram_client.get_entity(int(target))
 
     target = target.replace("https://t.me/", "")
     target = target.replace("http://t.me/", "")
     target = target.replace("t.me/", "")
     target = target.strip("/")
 
-    return await client.get_entity(target)
+    return await telegram_client.get_entity(target)
 
 
 def split_file(path: Path) -> list[Path]:
@@ -140,10 +156,7 @@ def split_file(path: Path) -> list[Path]:
                 current_path = path.with_name(
                     f"{path.stem}_part_{part_number}.txt"
                 )
-                current = current_path.open(
-                    "w",
-                    encoding="utf-8",
-                )
+                current = current_path.open("w", encoding="utf-8")
                 parts.append(current_path)
 
             current.write(line)
@@ -156,11 +169,10 @@ def split_file(path: Path) -> list[Path]:
 
 
 async def export_chat(
-    client: TelegramClient,
     target: str,
     progress: Optional[Message] = None,
 ) -> list[Path]:
-    entity = await resolve_entity(client, target)
+    entity = await resolve_entity(target)
 
     title = (
         getattr(entity, "title", None)
@@ -173,13 +185,11 @@ async def export_chat(
 
     with output.open("w", encoding="utf-8") as file:
         file.write(f"Чат: {title}\n")
-        file.write(
-            f"ID: {getattr(entity, 'id', 'неизвестно')}\n"
-        )
+        file.write(f"ID: {getattr(entity, 'id', 'неизвестно')}\n")
         file.write("=" * 80 + "\n\n")
 
         try:
-            async for msg in client.iter_messages(
+            async for msg in telegram_client.iter_messages(
                 entity,
                 reverse=True,
             ):
@@ -218,11 +228,7 @@ async def export_chat(
 
         except FloodWaitError as error:
             await asyncio.sleep(error.seconds)
-            return await export_chat(
-                client,
-                target,
-                progress,
-            )
+            return await export_chat(target, progress)
 
     return split_file(output)
 
@@ -236,27 +242,250 @@ async def start(message: Message):
         await message.answer("Доступ запрещён.")
         return
 
+    authorized = await telegram_client.is_user_authorized()
+
+    status = (
+        "Пользовательский аккаунт подключён."
+        if authorized
+        else "Пользовательский аккаунт не подключён."
+    )
+
     await message.answer(
-        "Бот готов.\n\n"
-        "Отправьте команду:\n"
-        "/export @username\n"
-        "/export https://t.me/username\n"
-        "/export -1001234567890\n\n"
-        "При первом запуске в консоли потребуется "
-        "войти в пользовательский Telegram-аккаунт."
+        f"{status}\n\n"
+        "Команды:\n"
+        "/login — войти в Telegram-аккаунт\n"
+        "/status — проверить авторизацию\n"
+        "/logout — выйти из пользовательского аккаунта\n"
+        "/export @username — выгрузить чат\n"
+        "/cancel — отменить текущую операцию"
     )
 
 
+@router.message(Command("status"))
+async def status_command(message: Message):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    authorized = await telegram_client.is_user_authorized()
+
+    if not authorized:
+        await message.answer(
+            "Пользовательский аккаунт не авторизован.\n"
+            "Используйте /login."
+        )
+        return
+
+    me = await telegram_client.get_me()
+
+    name = " ".join(
+        part
+        for part in [
+            getattr(me, "first_name", None),
+            getattr(me, "last_name", None),
+        ]
+        if part
+    ).strip()
+
+    username = getattr(me, "username", None)
+
+    await message.answer(
+        "Аккаунт подключён.\n\n"
+        f"Имя: {name or 'не указано'}\n"
+        f"Username: @{username}" if username else
+        "Аккаунт подключён.\n\n"
+        f"Имя: {name or 'не указано'}\n"
+        "Username: не указан"
+    )
+
+
+@router.message(Command("login"))
+async def login_command(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    if await telegram_client.is_user_authorized():
+        await message.answer(
+            "Пользовательский аккаунт уже авторизован."
+        )
+        return
+
+    await state.clear()
+    await state.set_state(LoginStates.waiting_phone)
+
+    await message.answer(
+        "Отправьте номер телефона пользовательского "
+        "Telegram-аккаунта в международном формате.\n\n"
+        "Пример: +79991234567"
+    )
+
+
+@router.message(LoginStates.waiting_phone, F.text)
+async def login_phone(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    phone = message.text.strip().replace(" ", "")
+
+    if not re.fullmatch(r"\+\d{8,15}", phone):
+        await message.answer(
+            "Неверный формат номера.\n"
+            "Пример: +79991234567"
+        )
+        return
+
+    try:
+        sent = await telegram_client.send_code_request(phone)
+
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent.phone_code_hash,
+        )
+        await state.set_state(LoginStates.waiting_code)
+
+        await message.answer(
+            "Код отправлен в Telegram.\n\n"
+            "Отправьте код одним сообщением.\n"
+            "Можно написать цифры через пробел, например: 1 2 3 4 5"
+        )
+
+    except PhoneNumberInvalidError:
+        await message.answer("Telegram считает этот номер неверным.")
+    except FloodWaitError as error:
+        await message.answer(
+            f"Слишком много попыток. Повторите через "
+            f"{error.seconds} секунд."
+        )
+    except Exception as error:
+        logger.exception("Ошибка отправки кода")
+        await message.answer(
+            f"Ошибка: {type(error).__name__}: {error}"
+        )
+
+
+@router.message(LoginStates.waiting_code, F.text)
+async def login_code(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    code = re.sub(r"\D", "", message.text)
+    data = await state.get_data()
+
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+
+    if not phone or not phone_code_hash:
+        await state.clear()
+        await message.answer(
+            "Данные авторизации потеряны. Начните заново: /login"
+        )
+        return
+
+    try:
+        await telegram_client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash,
+        )
+
+        await state.clear()
+        await message.answer(
+            "Готово. Пользовательский Telegram-аккаунт подключён."
+        )
+
+    except SessionPasswordNeededError:
+        await state.set_state(LoginStates.waiting_password)
+        await message.answer(
+            "На аккаунте включена двухэтапная аутентификация.\n\n"
+            "Отправьте пароль 2FA."
+        )
+
+    except PhoneCodeInvalidError:
+        await message.answer(
+            "Неверный код. Попробуйте ещё раз."
+        )
+
+    except PhoneCodeExpiredError:
+        await state.clear()
+        await message.answer(
+            "Срок действия кода истёк.\n"
+            "Начните заново: /login"
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка входа по коду")
+        await message.answer(
+            f"Ошибка: {type(error).__name__}: {error}"
+        )
+
+
+@router.message(LoginStates.waiting_password, F.text)
+async def login_password(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    password = message.text
+
+    try:
+        await telegram_client.sign_in(password=password)
+
+        await state.clear()
+        await message.answer(
+            "Готово. Пользовательский Telegram-аккаунт подключён."
+        )
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
+    except Exception as error:
+        logger.exception("Ошибка пароля 2FA")
+        await message.answer(
+            "Не удалось войти.\n"
+            f"Ошибка: {type(error).__name__}: {error}"
+        )
+
+
+@router.message(Command("logout"))
+async def logout_command(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    await state.clear()
+
+    if not await telegram_client.is_user_authorized():
+        await message.answer("Аккаунт уже отключён.")
+        return
+
+    await telegram_client.log_out()
+    await message.answer(
+        "Пользовательский аккаунт отключён.\n"
+        "Для повторного входа используйте /login."
+    )
+
+
+@router.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    if not message.from_user or not is_allowed(message.from_user.id):
+        return
+
+    await state.clear()
+    await message.answer("Текущая операция отменена.")
+
+
 @router.message(Command("export"))
-async def export_command(
-    message: Message,
-    client: TelegramClient,
-):
+async def export_command(message: Message):
     if not message.from_user:
         return
 
     if not is_allowed(message.from_user.id):
         await message.answer("Доступ запрещён.")
+        return
+
+    if not await telegram_client.is_user_authorized():
+        await message.answer(
+            "Сначала подключите пользовательский аккаунт: /login"
+        )
         return
 
     args = message.text.split(maxsplit=1) if message.text else []
@@ -290,11 +519,7 @@ async def export_command(
         paths: list[Path] = []
 
         try:
-            paths = await export_chat(
-                client,
-                target,
-                progress,
-            )
+            paths = await export_chat(target, progress)
 
             await progress.edit_text(
                 "Выгрузка завершена. Отправляю файл…"
@@ -322,35 +547,17 @@ async def export_command(
 
 
 async def main():
-    client = TelegramClient(
-        SESSION_NAME,
-        API_ID,
-        API_HASH,
-    )
-
-    # При первом запуске Telethon сам попросит:
-    # номер телефона, код из Telegram и пароль 2FA
-    await client.start()
-
-    me = await client.get_me()
-
-    logger.info(
-        "Пользовательская сессия запущена: %s",
-        getattr(me, "id", "неизвестно"),
-    )
+    await telegram_client.connect()
 
     bot = Bot(BOT_TOKEN)
-    dispatcher = Dispatcher()
+    dispatcher = Dispatcher(storage=MemoryStorage())
     dispatcher.include_router(router)
 
     try:
-        await dispatcher.start_polling(
-            bot,
-            client=client,
-        )
+        await dispatcher.start_polling(bot)
     finally:
         await bot.session.close()
-        await client.disconnect()
+        await telegram_client.disconnect()
 
 
 if __name__ == "__main__":
