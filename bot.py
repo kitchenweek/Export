@@ -5,6 +5,7 @@ import string
 import time
 from datetime import datetime
 import logging
+import re
 
 # Настройка логирования
 logging.basicConfig(
@@ -19,13 +20,13 @@ API_ID = 36658004
 API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
 BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
 
-# ===== ОПТИМАЛЬНЫЕ НАСТРОЙКИ (БЕЗ FLOOD) =====
-MAX_CONCURRENT_CHECKS = 1  # ТОЛЬКО 1 поток!
-BATCH_SIZE = 2  # Всего 2 ссылки за раз
-CHECK_DELAY = 5.0  # Задержка 5 секунд
-ACTIVATION_DELAY = 4.0  # Задержка 4 секунды
-BETWEEN_BATCHES = 3.0  # Пауза 3 секунды
-MAX_RETRIES = 3  # Повторов при ошибке
+# ===== ОПТИМАЛЬНЫЕ НАСТРОЙКИ =====
+MAX_CONCURRENT_CHECKS = 1
+BATCH_SIZE = 2
+CHECK_DELAY = 5.0
+ACTIVATION_DELAY = 4.0
+BETWEEN_BATCHES = 3.0
+MAX_RETRIES = 3
 
 # ===== СОЗДАЕМ КЛИЕНТА БОТА =====
 bot_client = TelegramClient(
@@ -63,7 +64,7 @@ def generate_cryptobot_link():
     return f"http://t.me/CryptoBot?start={prefix}{random_part}"
 
 def extract_start_param(link):
-    """Извлекает параметр start из ссылки"""
+    """Извлекает параметр start из ссылки (только CQ...)"""
     if 'start=' in link:
         return link.split('start=')[1].strip()
     return None
@@ -97,7 +98,7 @@ async def start_auth(phone):
             connection_retries=5,
             retry_delay=2,
             auto_reconnect=True,
-            flood_sleep_threshold=120  # Увеличен порог
+            flood_sleep_threshold=120
         )
         
         await user_client.connect()
@@ -158,7 +159,7 @@ async def logout_user():
         return True, "✅ Выход выполнен"
     return False, "❌ Не авторизован"
 
-# ===== ОБРАБОТЧИК FLOOD WAIT =====
+# ===== БЕЗОПАСНАЯ ОТПРАВКА =====
 async def safe_send_message(client, entity, message):
     """Безопасная отправка сообщения с обработкой flood wait"""
     global flood_wait_active
@@ -170,9 +171,8 @@ async def safe_send_message(client, entity, message):
         except Exception as e:
             error = str(e)
             if 'flood' in error.lower() or 'wait' in error.lower():
-                # Извлекаем время ожидания
                 import re
-                wait_time = 60  # По умолчанию 60 секунд
+                wait_time = 60
                 match = re.search(r'wait for (\d+)', error)
                 if match:
                     wait_time = int(match.group(1)) + 5
@@ -180,9 +180,8 @@ async def safe_send_message(client, entity, message):
                     wait_time = int(re.search(r'(\d+) seconds', error).group(1)) + 5
                 
                 flood_wait_active = True
-                logger.warning(f"⏳ Flood wait {wait_time} секунд...")
+                logger.warning(f"⏳ Flood wait {wait_time} сек...")
                 
-                # Показываем прогресс
                 for i in range(int(wait_time), 0, -5):
                     logger.info(f"⏳ Ожидание {i} сек...")
                     await asyncio.sleep(5)
@@ -194,21 +193,24 @@ async def safe_send_message(client, entity, message):
     
     return False, "Превышено количество попыток"
 
-# ===== ФУНКЦИЯ АКТИВАЦИИ ССЫЛКИ =====
+# ===== ФУНКЦИЯ АКТИВАЦИИ ССЫЛКИ (ПРАВИЛЬНЫЙ ФОРМАТ) =====
 async def activate_link(link):
-    """Активирует ссылку - отправляет /start с параметром в CryptoBot"""
+    """Активирует ссылку - отправляет /start CQ... в CryptoBot"""
     try:
+        # Извлекаем только параметр start (CQ...)
         start_param = extract_start_param(link)
+        
         if not start_param:
             return False, "❌ Нет параметра start"
         
-        logger.info(f"🔗 Активирую: {link}")
-        logger.info(f"📝 Параметр: {start_param}")
-        
+        # Формируем команду ТОЛЬКО с параметром
         command = f"/start {start_param}"
-        logger.info(f"📤 Отправляю в {CRYPTOBOT_USERNAME}: {command}")
         
-        # Безопасная отправка
+        logger.info(f"🔗 Активирую ссылку: {link}")
+        logger.info(f"📝 Отправляю команду: {command}")
+        logger.info(f"📤 В бота: {CRYPTOBOT_USERNAME}")
+        
+        # Отправляем команду в CryptoBot
         success, error = await safe_send_message(user_client, CRYPTOBOT_USERNAME, command)
         
         if not success:
@@ -216,32 +218,46 @@ async def activate_link(link):
         
         logger.info(f"✅ Отправлено: {command}")
         
-        # Ждем ответ
+        # Ждем ответ от бота
         await asyncio.sleep(ACTIVATION_DELAY)
         
-        # Получаем ответ
+        # Получаем последние сообщения от CryptoBot
         responses = []
         async for msg in user_client.iter_messages(CRYPTOBOT_USERNAME, limit=5):
             if msg.text and len(msg.text) > 3:
                 responses.append(msg.text)
+                logger.info(f"📩 Ответ: {msg.text[:100]}...")
         
         if not responses:
             return False, "❌ Нет ответа от CryptoBot"
         
-        # Проверяем ответы
+        # Проверяем ответы на успешность
         for response in responses:
             text_lower = response.lower()
             
-            success_keywords = ['привет', 'добро пожаловать', 'успешно', 'активирован', 
-                              'готов', 'выберите', 'меню', 'баланс', 'кошелек']
-            error_keywords = ['ошибка', 'не найден', 'не существует', 'недействительный', 
-                            'invalid', 'error', 'неверный', 'истек']
+            # Ключевые слова успеха
+            success_keywords = [
+                'привет', 'добро пожаловать', 'успешно', 
+                'активирован', 'готов', 'выберите', 'меню',
+                'баланс', 'кошелек', 'открыт', 'доступен',
+                'создан', 'запущен', 'работает', 'выберите валюту',
+                'добрый день', 'здравствуйте'
+            ]
+            
+            # Ключевые слова ошибки
+            error_keywords = [
+                'ошибка', 'не найден', 'не существует', 
+                'недействительный', 'invalid', 'error',
+                'неверный', 'истек', 'закончился',
+                'не удалось', 'попробуйте позже', 'not found'
+            ]
             
             if any(keyword in text_lower for keyword in error_keywords):
                 return False, f"❌ Ошибка: {response[:100]}..."
             elif any(keyword in text_lower for keyword in success_keywords):
                 return True, f"✅ Успешно! {response[:100]}..."
         
+        # Если не нашли ни успех, ни ошибку - считаем успехом
         return True, f"✅ Активирована (ответ): {responses[0][:100]}..."
         
     except Exception as e:
@@ -254,7 +270,7 @@ async def check_with_send(link):
     try:
         logger.info(f"🔍 Проверяю через @send: {link}")
         
-        # Безопасная отправка
+        # Отправляем ПОЛНУЮ ссылку в @send
         success, error = await safe_send_message(user_client, SEND_BOT_USERNAME, link)
         
         if not success:
@@ -290,7 +306,7 @@ async def check_and_activate_link(link):
     processed_links.add(link)
     
     try:
-        # ШАГ 1: Проверяем через @send
+        # ШАГ 1: Проверяем через @send (отправляем полную ссылку)
         send_ok, send_msg = await check_with_send(link)
         
         if not send_ok:
@@ -299,7 +315,7 @@ async def check_and_activate_link(link):
         
         logger.info(f"✅ @send подтвердил: {link}")
         
-        # ШАГ 2: Активируем
+        # ШАГ 2: Активируем (отправляем /start CQ...)
         logger.info(f"🎯 Активирую: {link}")
         activate_ok, activate_msg = await activate_link(link)
         
@@ -334,11 +350,11 @@ async def search_worker():
     logger.info(f"⚡ Потоков: {MAX_CONCURRENT_CHECKS}")
     logger.info(f"📦 Пакет: {BATCH_SIZE} ссылок")
     logger.info(f"⏱ Задержка: {CHECK_DELAY} сек")
+    logger.info(f"📝 Формат: /start CQ...")
     logger.info(f"🛡️ Flood защита включена")
     
     while is_searching:
         try:
-            # Если flood wait активен - ждем
             if flood_wait_active:
                 logger.info("⏳ Ожидание окончания flood wait...")
                 await asyncio.sleep(10)
@@ -354,7 +370,7 @@ async def search_worker():
             
             logger.info(f"📦 Обрабатываю {len(batch)} ссылок...")
             
-            # Обрабатываем по одной (медленно, но без flood)
+            # Обрабатываем по одной
             for link in batch:
                 if not is_searching:
                     break
@@ -366,23 +382,23 @@ async def search_worker():
                     is_valid, msg = result
                     if is_valid:
                         total_activated += 1
+                        start_param = extract_start_param(link)
                         logger.info(f"🎯 АКТИВИРОВАНА #{total_activated}!")
-                        logger.info(f"🔗 {link}")
+                        logger.info(f"📝 Команда: /start {start_param}")
                         
                         try:
-                            start_param = extract_start_param(link)
                             await user_client.send_message(
                                 'me',
                                 f"🎯 **АКТИВИРОВАНА ССЫЛКА #{total_activated}!**\n\n"
                                 f"🔗 `{link}`\n"
-                                f"📝 `/start {start_param}`\n\n"
+                                f"📝 Отправлено: `/start {start_param}`\n\n"
                                 f"📊 {msg}\n"
                                 f"🔢 Попыток: {checked_count}"
                             )
                         except Exception as e:
                             logger.error(f"Ошибка уведомления: {e}")
                 
-                # Ждем перед следующей ссылкой (важно!)
+                # Ждем перед следующей ссылкой
                 await asyncio.sleep(CHECK_DELAY)
             
             # Статистика
@@ -393,8 +409,6 @@ async def search_worker():
                 f"{speed:.2f} ссылок/сек"
             )
             
-            # Пауза между пакетами
-            logger.info(f"⏳ Пауза {BETWEEN_BATCHES} сек...")
             await asyncio.sleep(BETWEEN_BATCHES)
             
         except Exception as e:
@@ -492,7 +506,7 @@ async def start_search(event):
     
     await event.reply(
         f"🚀 **Поиск запущен!**\n\n"
-        f"⚡ Медленный режим (без flood)\n"
+        f"📝 Формат отправки: `/start CQ...`\n"
         f"⏱ Задержка: {CHECK_DELAY} сек\n"
         f"📦 Пакет: {BATCH_SIZE} ссылок\n"
         f"🛡️ Flood защита активна\n\n"
@@ -599,9 +613,9 @@ async def start_command(event):
         f"/found - Активированные\n"
         f"/generate - Сгенерировать ссылки\n"
         f"/clear - Очистить\n\n"
-        f"⚙️ **Безопасный режим:**\n"
-        f"⏱ Задержка: {CHECK_DELAY} сек\n"
-        f"🛡️ Flood защита включена"
+        f"📝 **Формат:**\n"
+        f"Бот отправляет: `/start CQ...`\n"
+        f"⏱ Задержка: {CHECK_DELAY} сек"
     )
 
 # ===== ЗАПУСК =====
@@ -610,6 +624,7 @@ async def main():
         await bot_client.start(bot_token=BOT_TOKEN)
         
         print("🚀 БОТ ЗАПУЩЕН!")
+        print("📝 Отправляет: /start CQ...")
         print("⚙️ БЕЗОПАСНЫЙ РЕЖИМ (без flood)")
         print(f"⏱ Задержка: {CHECK_DELAY} сек")
         print("💡 /search - запустить поиск")
