@@ -5,7 +5,6 @@ import string
 import time
 from datetime import datetime
 import logging
-import sys
 
 # Настройка логирования
 logging.basicConfig(
@@ -25,6 +24,13 @@ MAX_CONCURRENT_CHECKS = 5
 BATCH_SIZE = 20
 MIN_DELAY = 0.2
 
+# ===== СОЗДАЕМ КЛИЕНТА БОТА СРАЗУ =====
+bot_client = TelegramClient(
+    'bot_session',
+    API_ID,
+    API_HASH
+)
+
 # ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
 SEND_BOT_USERNAME = '@send'
 is_searching = False
@@ -38,12 +44,7 @@ error_count = 0
 # Данные пользователя
 user_phone = None
 is_authorized = False
-
-# Клиенты
-bot_client = None
 user_client = None
-
-# Семафор для контроля параллельных запросов
 rate_limiter = None
 
 # ===== ФУНКЦИЯ ГЕНЕРАЦИИ ССЫЛОК =====
@@ -571,16 +572,7 @@ async def start_command(event):
 
 # ===== ЗАПУСК =====
 async def main():
-    global bot_client
-    
     try:
-        # Создаем клиента для бота
-        bot_client = TelegramClient(
-            'bot_session',
-            API_ID,
-            API_HASH
-        )
-        
         # Запускаем бота
         await bot_client.start(bot_token=BOT_TOKEN)
         
