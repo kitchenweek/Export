@@ -5,10 +5,7 @@ import string
 import time
 from datetime import datetime
 import logging
-from colorama import init, Fore, Style
-
-# Инициализация colorama
-init(autoreset=True)
+import sys
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,21 +21,21 @@ API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
 BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
 
 # Настройки скорости
-MAX_CONCURRENT_CHECKS = 15  # Параллельных проверок
-BATCH_SIZE = 50  # Размер пакета
-CHECK_TIMEOUT = 1.5  # Таймаут проверки
-MIN_DELAY = 0.05  # Минимальная задержка между пакетами
+MAX_CONCURRENT_CHECKS = 10  # Уменьшил для стабильности
+BATCH_SIZE = 30
+CHECK_TIMEOUT = 1.5
+MIN_DELAY = 0.1
 
 # ===== ИНИЦИАЛИЗАЦИЯ КЛИЕНТА =====
 client = TelegramClient(
     'ultra_bot_session',
     API_ID,
     API_HASH,
-    connection_retries=5,
+    connection_retries=3,
     retry_delay=1,
     auto_reconnect=True,
-    flood_sleep_threshold=60
-).start(bot_token=BOT_TOKEN)
+    flood_sleep_threshold=30
+)
 
 # ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
 SEND_BOT_USERNAME = '@send'
@@ -117,12 +114,11 @@ async def search_worker():
     found_links = []
     start_time = time.time()
     batch = []
-    last_found_time = time.time()
     found_in_batch = []
     
-    logger.info(f"{Fore.GREEN}🚀 Поиск запущен! Скорость: МАКСИМАЛЬНАЯ")
-    logger.info(f"{Fore.CYAN}⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}")
-    logger.info(f"{Fore.CYAN}📦 Размер пакета: {BATCH_SIZE}")
+    logger.info(f"🚀 Поиск запущен! Скорость: МАКСИМАЛЬНАЯ")
+    logger.info(f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}")
+    logger.info(f"📦 Размер пакета: {BATCH_SIZE}")
     
     while is_searching:
         try:
@@ -151,13 +147,9 @@ async def search_worker():
                     found_in_batch.append(link_data)
                     
                     # Уведомление о находке
-                    notification = (
-                        f"{Fore.GREEN}🎯 НАЙДЕНА РАБОЧАЯ ССЫЛКА #{total_found}!\n"
-                        f"{Fore.CYAN}🔗 {link}\n"
-                        f"{Fore.YELLOW}📊 Проверено: {checked_count} | Найдено: {total_found}\n"
-                        f"{Fore.BLUE}⚡ Скорость: {get_speed():.1f} ссылок/сек"
-                    )
-                    logger.info(notification)
+                    logger.info(f"🎯 НАЙДЕНА РАБОЧАЯ ССЫЛКА #{total_found}!")
+                    logger.info(f"🔗 {link}")
+                    logger.info(f"📊 Проверено: {checked_count} | Найдено: {total_found}")
                     
                     # Отправляем в Telegram
                     try:
@@ -174,16 +166,16 @@ async def search_worker():
             
             # Если найдены ссылки в этом пакете, показываем статистику
             if found_in_batch:
-                logger.info(f"{Fore.GREEN}✅ Найдено {len(found_in_batch)} ссылок в пакете!")
+                logger.info(f"✅ Найдено {len(found_in_batch)} ссылок в пакете!")
                 found_in_batch = []
             
             # Обновляем статус каждые 100 проверок
             if checked_count % 100 == 0:
                 speed = get_speed()
                 logger.info(
-                    f"{Fore.CYAN}📊 Статус: {checked_count} проверок | "
-                    f"{Fore.GREEN}{total_found} найдено | "
-                    f"{Fore.YELLOW}{speed:.1f} ссылок/сек"
+                    f"📊 Статус: {checked_count} проверок | "
+                    f"{total_found} найдено | "
+                    f"{speed:.1f} ссылок/сек"
                 )
             
             # Маленькая задержка между пакетами
@@ -191,23 +183,22 @@ async def search_worker():
             
         except Exception as e:
             error_count += 1
-            logger.error(f"{Fore.RED}❌ Ошибка в поиске: {e}")
+            logger.error(f"❌ Ошибка в поиске: {e}")
             await asyncio.sleep(0.5)
 
 # ===== ОБРАБОТЧИКИ КОМАНД =====
 @client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
     await event.reply(
-        f"{Fore.CYAN}🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
-        f"{Fore.GREEN}📌 **Команды:**\n"
+        f"🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
+        f"📌 **Команды:**\n"
         f"/start - Показать это сообщение\n"
         f"/search - Запустить поиск (МАКСИМАЛЬНАЯ СКОРОСТЬ)\n"
         f"/stop - Остановить поиск\n"
         f"/status - Статистика\n"
         f"/found - Показать найденные ссылки\n"
-        f"/clear - Очистить найденные ссылки\n"
-        f"/restart - Перезапустить бота\n\n"
-        f"{Fore.YELLOW}⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}\n"
+        f"/clear - Очистить найденные ссылки\n\n"
+        f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}\n"
         f"📦 Размер пакета: {BATCH_SIZE}"
     )
 
@@ -321,33 +312,42 @@ async def clear_found(event):
     total_found = 0
     await event.reply(f"🧹 Очищено {count} найденных ссылок.")
 
-@client.on(events.NewMessage(pattern='/restart'))
-async def restart_bot(event):
-    await event.reply("🔄 Перезапуск бота...")
-    logger.info("Перезапуск бота...")
-    await client.disconnect()
-    await asyncio.sleep(1)
-    await client.start()
-    logger.info("✅ Бот перезапущен!")
-
 # ===== ЗАПУСК =====
 async def main():
     try:
-        print(f"{Fore.GREEN}🚀 ULTRA SPEED BOT STARTED!")
-        print(f"{Fore.CYAN}⚡ Concurrent checks: {MAX_CONCURRENT_CHECKS}")
-        print(f"{Fore.CYAN}📦 Batch size: {BATCH_SIZE}")
-        print(f"{Fore.YELLOW}💡 Используйте /search для запуска поиска")
-        print(f"{Fore.MAGENTA}📌 Бот @{BOT_TOKEN.split(':')[0]} запущен!")
+        print("🚀 ULTRA SPEED BOT STARTED!")
+        print(f"⚡ Concurrent checks: {MAX_CONCURRENT_CHECKS}")
+        print(f"📦 Batch size: {BATCH_SIZE}")
+        print("💡 Используйте /search для запуска поиска")
+        print(f"📌 Бот запущен!")
         
-        await client.start()
+        # Запускаем клиент
+        await client.start(bot_token=BOT_TOKEN)
+        print("✅ Бот успешно запущен!")
+        
+        # Запускаем бесконечный цикл
         await client.run_until_disconnected()
+        
+    except KeyboardInterrupt:
+        print("\n👋 Бот остановлен пользователем")
     except Exception as e:
-        logger.error(f"{Fore.RED}❌ Критическая ошибка: {e}")
+        print(f"❌ Ошибка: {e}")
     finally:
         await client.disconnect()
 
+# Правильный способ запуска с одним event loop
 if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        # Создаем новый event loop и запускаем
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
-        print(f"\n{Fore.YELLOW}👋 Бот остановлен пользователем")
+        print("\n👋 Бот остановлен")
+    except Exception as e:
+        print(f"❌ Фатальная ошибка: {e}")
+    finally:
+        try:
+            loop.close()
+        except:
+            pass
