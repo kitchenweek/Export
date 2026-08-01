@@ -5,8 +5,6 @@ import string
 import time
 from datetime import datetime
 import logging
-import os
-import json
 
 # Настройка логирования
 logging.basicConfig(
@@ -26,6 +24,13 @@ MAX_CONCURRENT_CHECKS = 5
 BATCH_SIZE = 20
 MIN_DELAY = 0.2
 
+# ===== СОЗДАЕМ БОТА =====
+bot_client = TelegramClient(
+    'bot_session',
+    API_ID,
+    API_HASH
+).start(bot_token=BOT_TOKEN)
+
 # ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
 SEND_BOT_USERNAME = '@send'
 is_searching = False
@@ -40,11 +45,10 @@ error_count = 0
 user_phone = None
 user_password = None
 is_authorized = False
-auth_code = None
-auth_step = 'idle'  # idle, waiting_phone, waiting_code, waiting_password
 
-# Словарь для хранения сессий пользователей
-user_sessions = {}
+# Клиент для пользователя
+user_client = None
+user_client_connected = False
 
 # Семафор для контроля параллельных запросов
 rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
@@ -71,22 +75,16 @@ def get_elapsed():
         return time.time() - start_time
     return 0
 
-# ===== КЛАСС ДЛЯ УПРАВЛЕНИЯ АВТОРИЗАЦИЕЙ =====
-class AuthManager:
-    def __init__(self):
-        self.phone = None
-        self.password = None
-        self.client = None
-        self.is_authenticated = False
-        
-    async def start_auth(self, phone, password=None):
-        """Начинает процесс авторизации"""
-        self.phone = phone
-        self.password = password
-        
-        # Создаем клиент для этого пользователя
+# ===== ФУНКЦИИ АВТОРИЗАЦИИ =====
+async def start_auth(phone):
+    """Начинает процесс авторизации"""
+    global user_client, user_client_connected, user_phone
+    
+    try:
+        user_phone = phone
         session_name = f"user_{phone.replace('+', '')}"
-        self.client = TelegramClient(
+        
+        user_client = TelegramClient(
             session_name,
             API_ID,
             API_HASH,
@@ -95,73 +93,75 @@ class AuthManager:
             auto_reconnect=True
         )
         
-        try:
-            await self.client.connect()
-            
-            # Проверяем, есть ли сохраненная сессия
-            if await self.client.is_user_authorized():
-                self.is_authenticated = True
-                me = await self.client.get_me()
-                return True, f"✅ Уже авторизован как {me.first_name}"
-            
-            # Отправляем код
-            await self.client.send_code_request(phone)
-            return False, "📱 Код подтверждения отправлен в Telegram"
-            
-        except Exception as e:
-            return False, f"❌ Ошибка: {str(e)}"
-    
-    async def complete_auth(self, code):
-        """Завершает авторизацию с кодом"""
-        try:
-            await self.client.sign_in(self.phone, code)
-            self.is_authenticated = True
-            me = await self.client.get_me()
-            return True, f"✅ Авторизация успешна! {me.first_name}"
-        except Exception as e:
-            error = str(e)
-            if 'password' in error.lower():
-                return False, "🔑 Требуется пароль 2FA. Используйте /setpassword <пароль>"
-            return False, f"❌ Ошибка: {error}"
-    
-    async def complete_auth_with_password(self, password):
-        """Завершает авторизацию с паролем 2FA"""
-        try:
-            await self.client.sign_in(password=password)
-            self.is_authenticated = True
-            me = await self.client.get_me()
-            return True, f"✅ Авторизация успешна! {me.first_name}"
-        except Exception as e:
-            return False, f"❌ Ошибка: {str(e)}"
-    
-    async def logout(self):
-        """Выход из аккаунта"""
-        if self.client:
-            await self.client.disconnect()
-            self.is_authenticated = False
-            self.client = None
-            return True, "✅ Выход выполнен"
-        return False, "❌ Не авторизован"
+        await user_client.connect()
+        
+        # Проверяем сохраненную сессию
+        if await user_client.is_user_authorized():
+            user_client_connected = True
+            me = await user_client.get_me()
+            return True, f"✅ Уже авторизован как {me.first_name}"
+        
+        # Отправляем код
+        await user_client.send_code_request(phone)
+        return False, "📱 Код подтверждения отправлен в Telegram"
+        
+    except Exception as e:
+        return False, f"❌ Ошибка: {str(e)}"
 
-# Глобальный менеджер авторизации
-auth_manager = AuthManager()
+async def complete_auth(code):
+    """Завершает авторизацию с кодом"""
+    global user_client_connected
+    
+    try:
+        await user_client.sign_in(user_phone, code)
+        user_client_connected = True
+        me = await user_client.get_me()
+        return True, f"✅ Авторизация успешна! {me.first_name}"
+    except Exception as e:
+        error = str(e)
+        if 'password' in error.lower():
+            return False, "🔑 Требуется пароль 2FA. Используйте /setpassword <пароль>"
+        return False, f"❌ Ошибка: {error}"
+
+async def complete_auth_with_password(password):
+    """Завершает авторизацию с паролем 2FA"""
+    global user_client_connected
+    
+    try:
+        await user_client.sign_in(password=password)
+        user_client_connected = True
+        me = await user_client.get_me()
+        return True, f"✅ Авторизация успешна! {me.first_name}"
+    except Exception as e:
+        return False, f"❌ Ошибка: {str(e)}"
+
+async def logout_user():
+    """Выход из аккаунта"""
+    global user_client, user_client_connected
+    
+    if user_client:
+        await user_client.disconnect()
+        user_client = None
+        user_client_connected = False
+        return True, "✅ Выход выполнен"
+    return False, "❌ Не авторизован"
 
 # ===== ОСНОВНЫЕ ФУНКЦИИ =====
 async def check_link_fast(link):
     """Быстрая проверка ссылки через @send"""
-    if not auth_manager.is_authenticated or not auth_manager.client:
+    if not user_client_connected or not user_client:
         return False, "❌ Не авторизован"
     
     try:
         async with rate_limiter:
             # Отправляем ссылку
-            await auth_manager.client.send_message(SEND_BOT_USERNAME, link)
+            await user_client.send_message(SEND_BOT_USERNAME, link)
             
             # Минимальная задержка для получения ответа
             await asyncio.sleep(0.3)
             
             # Получаем последний ответ
-            async for msg in auth_manager.client.iter_messages(SEND_BOT_USERNAME, limit=1):
+            async for msg in user_client.iter_messages(SEND_BOT_USERNAME, limit=1):
                 if msg.text and msg.text != link and len(msg.text) > 5:
                     text_lower = msg.text.lower()
                     error_keywords = ['error', 'invalid', 'не найден', 'не существует', 'ошибка']
@@ -186,7 +186,7 @@ async def search_worker():
     """Основной рабочий процесс поиска"""
     global is_searching, checked_count, found_links, start_time, total_found, error_count
     
-    if not auth_manager.is_authenticated:
+    if not user_client_connected:
         logger.error("❌ Не авторизован для поиска")
         return
     
@@ -225,7 +225,7 @@ async def search_worker():
                     logger.info(f"🔗 {link}")
                     
                     try:
-                        await auth_manager.client.send_message(
+                        await user_client.send_message(
                             'me',
                             f"🎯 **РАБОЧАЯ ССЫЛКА #{total_found}!**\n\n"
                             f"🔗 `{link}`\n\n"
@@ -258,11 +258,9 @@ async def search_worker():
 # ===== ОБРАБОТЧИКИ КОМАНД =====
 
 # Команда для ввода номера
-@client.on(events.NewMessage(pattern='/setphone'))
+@bot_client.on(events.NewMessage(pattern='/setphone'))
 async def set_phone(event):
     """Установка номера телефона"""
-    global auth_step
-    
     parts = event.message.text.split()
     if len(parts) < 2:
         await event.reply(
@@ -286,7 +284,7 @@ async def set_phone(event):
     # Начинаем авторизацию
     status_msg = await event.reply(f"📱 Подключаюсь к номеру {phone}...")
     
-    result, message = await auth_manager.start_auth(phone)
+    result, message = await start_auth(phone)
     
     if result:
         await status_msg.edit(f"✅ {message}")
@@ -299,10 +297,10 @@ async def set_phone(event):
     )
 
 # Команда для ввода кода
-@client.on(events.NewMessage(pattern='/setcode'))
+@bot_client.on(events.NewMessage(pattern='/setcode'))
 async def set_code(event):
     """Ввод кода подтверждения"""
-    if not auth_manager.phone:
+    if not user_phone:
         await event.reply("❌ Сначала введите номер: `/setphone +71234567890`")
         return
     
@@ -323,7 +321,7 @@ async def set_code(event):
     
     status_msg = await event.reply("🔐 Проверяю код...")
     
-    result, message = await auth_manager.complete_auth(code)
+    result, message = await complete_auth(code)
     
     if result:
         await status_msg.edit(f"✅ {message}")
@@ -346,7 +344,7 @@ async def set_code(event):
             await status_msg.edit(f"❌ {message}")
 
 # Команда для ввода пароля 2FA
-@client.on(events.NewMessage(pattern='/setpassword'))
+@bot_client.on(events.NewMessage(pattern='/setpassword'))
 async def set_password(event):
     """Ввод пароля 2FA"""
     parts = event.message.text.split(maxsplit=1)
@@ -365,7 +363,7 @@ async def set_password(event):
     
     status_msg = await event.reply("🔐 Проверяю пароль...")
     
-    result, message = await auth_manager.complete_auth_with_password(password)
+    result, message = await complete_auth_with_password(password)
     
     if result:
         await status_msg.edit(f"✅ {message}")
@@ -381,7 +379,7 @@ async def set_password(event):
         await status_msg.edit(f"❌ {message}")
 
 # Команда для выхода
-@client.on(events.NewMessage(pattern='/logout'))
+@bot_client.on(events.NewMessage(pattern='/logout'))
 async def logout(event):
     """Выход из аккаунта"""
     global is_searching, search_task
@@ -390,16 +388,16 @@ async def logout(event):
         await event.reply("⏹ Сначала остановите поиск: /stop")
         return
     
-    result, message = await auth_manager.logout()
+    result, message = await logout_user()
     await event.reply(message)
 
 # Команда для статуса авторизации
-@client.on(events.NewMessage(pattern='/authstatus'))
+@bot_client.on(events.NewMessage(pattern='/authstatus'))
 async def auth_status(event):
     """Проверка статуса авторизации"""
-    if auth_manager.is_authenticated:
+    if user_client_connected and user_client:
         try:
-            me = await auth_manager.client.get_me()
+            me = await user_client.get_me()
             await event.reply(
                 f"✅ **Авторизован**\n\n"
                 f"👤 {me.first_name} {me.last_name or ''}\n"
@@ -417,7 +415,7 @@ async def auth_status(event):
         )
 
 # Команда для генерации ссылок
-@client.on(events.NewMessage(pattern='/generate'))
+@bot_client.on(events.NewMessage(pattern='/generate'))
 async def generate_links(event):
     """Генерирует и показывает ссылки"""
     parts = event.message.text.split()
@@ -438,12 +436,12 @@ async def generate_links(event):
     
     await event.reply(response)
 
-# Остальные команды (search, stop, status, found, clear)
-@client.on(events.NewMessage(pattern='/search'))
+# Команда для запуска поиска
+@bot_client.on(events.NewMessage(pattern='/search'))
 async def start_search(event):
     global is_searching, search_task
     
-    if not auth_manager.is_authenticated:
+    if not user_client_connected:
         await event.reply("❌ Сначала авторизуйтесь: `/setphone +71234567890`")
         return
     
@@ -462,7 +460,8 @@ async def start_search(event):
         f"📊 Для просмотра статистики используйте /status"
     )
 
-@client.on(events.NewMessage(pattern='/stop'))
+# Команда для остановки поиска
+@bot_client.on(events.NewMessage(pattern='/stop'))
 async def stop_search(event):
     global is_searching, search_task
     
@@ -492,7 +491,8 @@ async def stop_search(event):
         f"🚀 Скорость: {speed:.1f} ссылок/сек"
     )
 
-@client.on(events.NewMessage(pattern='/status'))
+# Команда для статуса
+@bot_client.on(events.NewMessage(pattern='/status'))
 async def show_status(event):
     if not is_searching:
         await event.reply("⚠️ Поиск не запущен. Используйте /search для запуска.")
@@ -520,7 +520,8 @@ async def show_status(event):
     
     await event.reply(status_text)
 
-@client.on(events.NewMessage(pattern='/found'))
+# Команда для показа найденных ссылок
+@bot_client.on(events.NewMessage(pattern='/found'))
 async def show_found_links(event):
     if not found_links:
         await event.reply("❌ Пока не найдено ни одной рабочей ссылки.")
@@ -537,7 +538,8 @@ async def show_found_links(event):
         f"📌 Последние 5:\n{links_text}"
     )
 
-@client.on(events.NewMessage(pattern='/clear'))
+# Команда для очистки
+@bot_client.on(events.NewMessage(pattern='/clear'))
 async def clear_found(event):
     global found_links, total_found
     count = len(found_links)
@@ -545,7 +547,8 @@ async def clear_found(event):
     total_found = 0
     await event.reply(f"🧹 Очищено {count} найденных ссылок.")
 
-@client.on(events.NewMessage(pattern='/start'))
+# Команда /start
+@bot_client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
     await event.reply(
         f"🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
@@ -573,31 +576,23 @@ async def main():
         print("📌 Команды для авторизации доступны в боте")
         print("💡 /setphone +71234567890 - ввести номер")
         print("💡 /setcode 12345 - ввести код")
-        
-        await client.start(bot_token=BOT_TOKEN)
         print("✅ Бот запущен!")
-        print(f"📱 Бот: @{BOT_TOKEN.split(':')[0]}")
         
-        await client.run_until_disconnected()
+        await bot_client.run_until_disconnected()
         
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Ошибка: {e}")
     finally:
-        await client.disconnect()
+        await bot_client.disconnect()
+        if user_client:
+            await user_client.disconnect()
 
 if __name__ == '__main__':
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Фатальная ошибка: {e}")
-    finally:
-        try:
-            loop.close()
-        except:
-            pass
