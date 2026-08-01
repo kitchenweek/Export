@@ -5,6 +5,7 @@ import string
 import time
 from datetime import datetime
 import logging
+import sys
 
 # Настройка логирования
 logging.basicConfig(
@@ -24,13 +25,6 @@ MAX_CONCURRENT_CHECKS = 5
 BATCH_SIZE = 20
 MIN_DELAY = 0.2
 
-# ===== СОЗДАЕМ БОТА =====
-bot_client = TelegramClient(
-    'bot_session',
-    API_ID,
-    API_HASH
-).start(bot_token=BOT_TOKEN)
-
 # ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
 SEND_BOT_USERNAME = '@send'
 is_searching = False
@@ -43,15 +37,14 @@ error_count = 0
 
 # Данные пользователя
 user_phone = None
-user_password = None
 is_authorized = False
 
-# Клиент для пользователя
+# Клиенты
+bot_client = None
 user_client = None
-user_client_connected = False
 
 # Семафор для контроля параллельных запросов
-rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
+rate_limiter = None
 
 # ===== ФУНКЦИЯ ГЕНЕРАЦИИ ССЫЛОК =====
 CHARS = string.ascii_letters + string.digits
@@ -78,7 +71,7 @@ def get_elapsed():
 # ===== ФУНКЦИИ АВТОРИЗАЦИИ =====
 async def start_auth(phone):
     """Начинает процесс авторизации"""
-    global user_client, user_client_connected, user_phone
+    global user_client, is_authorized, user_phone, rate_limiter
     
     try:
         user_phone = phone
@@ -97,8 +90,9 @@ async def start_auth(phone):
         
         # Проверяем сохраненную сессию
         if await user_client.is_user_authorized():
-            user_client_connected = True
+            is_authorized = True
             me = await user_client.get_me()
+            rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
             return True, f"✅ Уже авторизован как {me.first_name}"
         
         # Отправляем код
@@ -106,16 +100,18 @@ async def start_auth(phone):
         return False, "📱 Код подтверждения отправлен в Telegram"
         
     except Exception as e:
+        logger.error(f"Ошибка авторизации: {e}")
         return False, f"❌ Ошибка: {str(e)}"
 
 async def complete_auth(code):
     """Завершает авторизацию с кодом"""
-    global user_client_connected
+    global is_authorized, rate_limiter
     
     try:
         await user_client.sign_in(user_phone, code)
-        user_client_connected = True
+        is_authorized = True
         me = await user_client.get_me()
+        rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
         return True, f"✅ Авторизация успешна! {me.first_name}"
     except Exception as e:
         error = str(e)
@@ -125,31 +121,35 @@ async def complete_auth(code):
 
 async def complete_auth_with_password(password):
     """Завершает авторизацию с паролем 2FA"""
-    global user_client_connected
+    global is_authorized, rate_limiter
     
     try:
         await user_client.sign_in(password=password)
-        user_client_connected = True
+        is_authorized = True
         me = await user_client.get_me()
+        rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
         return True, f"✅ Авторизация успешна! {me.first_name}"
     except Exception as e:
         return False, f"❌ Ошибка: {str(e)}"
 
 async def logout_user():
     """Выход из аккаунта"""
-    global user_client, user_client_connected
+    global user_client, is_authorized
     
     if user_client:
-        await user_client.disconnect()
+        try:
+            await user_client.disconnect()
+        except:
+            pass
         user_client = None
-        user_client_connected = False
+        is_authorized = False
         return True, "✅ Выход выполнен"
     return False, "❌ Не авторизован"
 
 # ===== ОСНОВНЫЕ ФУНКЦИИ =====
 async def check_link_fast(link):
     """Быстрая проверка ссылки через @send"""
-    if not user_client_connected or not user_client:
+    if not is_authorized or not user_client:
         return False, "❌ Не авторизован"
     
     try:
@@ -186,7 +186,7 @@ async def search_worker():
     """Основной рабочий процесс поиска"""
     global is_searching, checked_count, found_links, start_time, total_found, error_count
     
-    if not user_client_connected:
+    if not is_authorized:
         logger.error("❌ Не авторизован для поиска")
         return
     
@@ -395,7 +395,7 @@ async def logout(event):
 @bot_client.on(events.NewMessage(pattern='/authstatus'))
 async def auth_status(event):
     """Проверка статуса авторизации"""
-    if user_client_connected and user_client:
+    if is_authorized and user_client:
         try:
             me = await user_client.get_me()
             await event.reply(
@@ -441,7 +441,7 @@ async def generate_links(event):
 async def start_search(event):
     global is_searching, search_task
     
-    if not user_client_connected:
+    if not is_authorized:
         await event.reply("❌ Сначала авторизуйтесь: `/setphone +71234567890`")
         return
     
@@ -571,13 +571,26 @@ async def start_command(event):
 
 # ===== ЗАПУСК =====
 async def main():
+    global bot_client
+    
     try:
+        # Создаем клиента для бота
+        bot_client = TelegramClient(
+            'bot_session',
+            API_ID,
+            API_HASH
+        )
+        
+        # Запускаем бота
+        await bot_client.start(bot_token=BOT_TOKEN)
+        
         print("🚀 ULTRA SPEED BOT WITH PHONE AUTH!")
         print("📌 Команды для авторизации доступны в боте")
         print("💡 /setphone +71234567890 - ввести номер")
         print("💡 /setcode 12345 - ввести код")
         print("✅ Бот запущен!")
         
+        # Запускаем обработку
         await bot_client.run_until_disconnected()
         
     except KeyboardInterrupt:
@@ -585,14 +598,20 @@ async def main():
     except Exception as e:
         print(f"❌ Ошибка: {e}")
     finally:
-        await bot_client.disconnect()
+        if bot_client:
+            await bot_client.disconnect()
         if user_client:
             await user_client.disconnect()
 
 if __name__ == '__main__':
+    # Создаем и используем один event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     try:
-        asyncio.run(main())
+        loop.run_until_complete(main())
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
     except Exception as e:
         print(f"❌ Фатальная ошибка: {e}")
+    finally:
+        loop.close()
