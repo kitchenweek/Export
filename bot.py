@@ -1,564 +1,353 @@
+from telethon import TelegramClient, events
 import asyncio
+import random
+import string
+import time
+from datetime import datetime
 import logging
-import re
-from datetime import timezone
-from pathlib import Path
-from typing import Optional
+from colorama import init, Fore, Style
 
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import FSInputFile, Message
-from telethon import TelegramClient
-from telethon.errors import (
-    FloodWaitError,
-    PhoneCodeExpiredError,
-    PhoneCodeInvalidError,
-    PhoneNumberInvalidError,
-    SessionPasswordNeededError,
-)
-from telethon.tl.types import MessageService
+# Инициализация colorama
+init(autoreset=True)
 
-
-# =========================
-# НАСТРОЙКИ
-# =========================
-
-API_ID = 32200104
-API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
-BOT_TOKEN = "8498016557:AAFwjnX1Zcp96e1PCWVvmFplpmdEVUJMNZg"
-
-# Telegram ID администратора
-ADMIN_ID = 7517164478
-
-SESSION_NAME = "telegram_user"
-EXPORT_DIR = Path("exports")
-MAX_PART_SIZE = 45 * 1024 * 1024
-
-
-# =========================
-# ИНИЦИАЛИЗАЦИЯ
-# =========================
-
-EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-
+# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
 )
-
 logger = logging.getLogger(__name__)
-router = Router()
-export_locks: dict[int, asyncio.Lock] = {}
 
-telegram_client = TelegramClient(
-    SESSION_NAME,
+# ===== КОНФИГУРАЦИЯ =====
+API_ID = 36658004
+API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
+BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
+
+# Настройки скорости
+MAX_CONCURRENT_CHECKS = 15  # Параллельных проверок
+BATCH_SIZE = 50  # Размер пакета
+CHECK_TIMEOUT = 1.5  # Таймаут проверки
+MIN_DELAY = 0.05  # Минимальная задержка между пакетами
+
+# ===== ИНИЦИАЛИЗАЦИЯ КЛИЕНТА =====
+client = TelegramClient(
+    'ultra_bot_session',
     API_ID,
     API_HASH,
-)
+    connection_retries=5,
+    retry_delay=1,
+    auto_reconnect=True,
+    flood_sleep_threshold=60
+).start(bot_token=BOT_TOKEN)
 
+# ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
+SEND_BOT_USERNAME = '@send'
+is_searching = False
+search_task = None
+found_links = []
+checked_count = 0
+start_time = None
+total_found = 0
+error_count = 0
 
-class LoginStates(StatesGroup):
-    waiting_phone = State()
-    waiting_code = State()
-    waiting_password = State()
+# Семафор для контроля параллельных запросов
+rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
+# Предварительная генерация символов для скорости
+CHARS = string.ascii_letters + string.digits
+LINK_TEMPLATE = "http://t.me/CryptoBot?start={}"
 
-def is_allowed(user_id: int) -> bool:
-    return user_id == ADMIN_ID
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
+def generate_cryptobot_link():
+    """Максимально быстрая генерация ссылки"""
+    return LINK_TEMPLATE.format(''.join(random.choices(CHARS, k=14)))
 
+def get_speed():
+    """Вычисляет скорость проверки"""
+    if start_time and checked_count > 0:
+        elapsed = time.time() - start_time
+        return checked_count / elapsed if elapsed > 0 else 0
+    return 0
 
-def safe_filename(value: str) -> str:
-    value = re.sub(r'[\\/:*?"<>|]+', "_", value).strip(" ._")
-    return value[:80] or "telegram_chat"
+def get_elapsed():
+    """Возвращает прошедшее время"""
+    if start_time:
+        return time.time() - start_time
+    return 0
 
+# ===== ОСНОВНЫЕ ФУНКЦИИ =====
+async def check_link_fast(link):
+    """Быстрая проверка ссылки через @send"""
+    try:
+        async with rate_limiter:
+            # Отправляем ссылку
+            await client.send_message(SEND_BOT_USERNAME, link)
+            
+            # Минимальная задержка для получения ответа
+            await asyncio.sleep(0.3)
+            
+            # Получаем последний ответ
+            async for msg in client.iter_messages(SEND_BOT_USERNAME, limit=1):
+                if msg.text and msg.text != link and len(msg.text) > 5:
+                    text_lower = msg.text.lower()
+                    # Проверка на ошибки
+                    error_keywords = ['error', 'invalid', 'не найден', 'не существует', 'ошибка']
+                    if any(keyword in text_lower for keyword in error_keywords):
+                        return False, msg.text
+                    else:
+                        return True, msg.text
+                        
+    except Exception as e:
+        logger.error(f"Ошибка проверки {link}: {e}")
+        return False, None
+    
+    return False, None
 
-def message_text(message) -> str:
-    if isinstance(message, MessageService):
-        return f"[СЛУЖЕБНОЕ СООБЩЕНИЕ: {message.action}]"
+async def batch_check_links(links):
+    """Параллельная проверка пакета ссылок"""
+    tasks = [check_link_fast(link) for link in links]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    return results
 
-    text = message.message or ""
-
-    if message.media:
-        media_name = type(message.media).__name__
-        text = f"{text}\n[ВЛОЖЕНИЕ: {media_name}]".strip()
-
-    if not text:
-        text = "[ПУСТОЕ СООБЩЕНИЕ]"
-
-    return text
-
-
-async def sender_name(message) -> str:
-    sender = await message.get_sender()
-
-    if sender is None:
-        return "Неизвестный отправитель"
-
-    first_name = getattr(sender, "first_name", None)
-    last_name = getattr(sender, "last_name", None)
-    username = getattr(sender, "username", None)
-    sender_id = getattr(sender, "id", None)
-
-    name = " ".join(
-        part for part in [first_name, last_name] if part
-    ).strip()
-
-    if username:
-        name = f"{name} (@{username})".strip()
-
-    return name or str(sender_id or "Неизвестно")
-
-
-async def resolve_entity(target: str):
-    target = target.strip()
-
-    if re.fullmatch(r"-?\d+", target):
-        return await telegram_client.get_entity(int(target))
-
-    target = target.replace("https://t.me/", "")
-    target = target.replace("http://t.me/", "")
-    target = target.replace("t.me/", "")
-    target = target.strip("/")
-
-    return await telegram_client.get_entity(target)
-
-
-def split_file(path: Path) -> list[Path]:
-    if path.stat().st_size <= MAX_PART_SIZE:
-        return [path]
-
-    parts: list[Path] = []
-    part_number = 1
-    current_size = 0
-
-    current_path = path.with_name(
-        f"{path.stem}_part_{part_number}.txt"
-    )
-    current = current_path.open("w", encoding="utf-8")
-    parts.append(current_path)
-
-    with path.open("r", encoding="utf-8") as source:
-        for line in source:
-            line_size = len(line.encode("utf-8"))
-
-            if (
-                current_size + line_size > MAX_PART_SIZE
-                and current_size > 0
-            ):
-                current.close()
-
-                part_number += 1
-                current_size = 0
-
-                current_path = path.with_name(
-                    f"{path.stem}_part_{part_number}.txt"
-                )
-                current = current_path.open("w", encoding="utf-8")
-                parts.append(current_path)
-
-            current.write(line)
-            current_size += line_size
-
-    current.close()
-    path.unlink(missing_ok=True)
-
-    return parts
-
-
-async def export_chat(
-    target: str,
-    progress: Optional[Message] = None,
-) -> list[Path]:
-    entity = await resolve_entity(target)
-
-    title = (
-        getattr(entity, "title", None)
-        or getattr(entity, "username", None)
-        or "telegram_chat"
-    )
-
-    output = EXPORT_DIR / f"{safe_filename(title)}.txt"
-    count = 0
-
-    with output.open("w", encoding="utf-8") as file:
-        file.write(f"Чат: {title}\n")
-        file.write(f"ID: {getattr(entity, 'id', 'неизвестно')}\n")
-        file.write("=" * 80 + "\n\n")
-
+async def search_worker():
+    """Основной рабочий процесс поиска"""
+    global is_searching, checked_count, found_links, start_time, total_found, error_count
+    
+    checked_count = 0
+    found_links = []
+    start_time = time.time()
+    batch = []
+    last_found_time = time.time()
+    found_in_batch = []
+    
+    logger.info(f"{Fore.GREEN}🚀 Поиск запущен! Скорость: МАКСИМАЛЬНАЯ")
+    logger.info(f"{Fore.CYAN}⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}")
+    logger.info(f"{Fore.CYAN}📦 Размер пакета: {BATCH_SIZE}")
+    
+    while is_searching:
         try:
-            async for msg in telegram_client.iter_messages(
-                entity,
-                reverse=True,
-            ):
-                count += 1
-
-                date = msg.date.astimezone(
-                    timezone.utc
-                ).strftime("%d.%m.%Y %H:%M:%S UTC")
-
-                sender = await sender_name(msg)
-
-                reply = ""
-                if msg.reply_to_msg_id:
-                    reply = (
-                        f" | ответ на сообщение "
-                        f"#{msg.reply_to_msg_id}"
+            # Генерируем пакет ссылок
+            batch = [generate_cryptobot_link() for _ in range(BATCH_SIZE)]
+            
+            # Проверяем пакет
+            results = await batch_check_links(batch)
+            
+            # Обрабатываем результаты
+            for link, result in zip(batch, results):
+                checked_count += 1
+                
+                if isinstance(result, tuple) and result[0]:
+                    # Найдена рабочая ссылка!
+                    is_valid, msg = result
+                    total_found += 1
+                    
+                    link_data = {
+                        'link': link,
+                        'result': msg or '✅ Валидная',
+                        'time': datetime.now().strftime('%H:%M:%S'),
+                        'attempt': checked_count
+                    }
+                    found_links.append(link_data)
+                    found_in_batch.append(link_data)
+                    
+                    # Уведомление о находке
+                    notification = (
+                        f"{Fore.GREEN}🎯 НАЙДЕНА РАБОЧАЯ ССЫЛКА #{total_found}!\n"
+                        f"{Fore.CYAN}🔗 {link}\n"
+                        f"{Fore.YELLOW}📊 Проверено: {checked_count} | Найдено: {total_found}\n"
+                        f"{Fore.BLUE}⚡ Скорость: {get_speed():.1f} ссылок/сек"
                     )
-
-                text = message_text(msg)
-
-                file.write(
-                    f"[{date}] #{msg.id} | "
-                    f"{sender}{reply}\n"
-                )
-                file.write(text)
-                file.write("\n" + "-" * 80 + "\n")
-
-                if progress and count % 1000 == 0:
+                    logger.info(notification)
+                    
+                    # Отправляем в Telegram
                     try:
-                        await progress.edit_text(
-                            "Выгружено сообщений: "
-                            f"{count:,}".replace(",", " ")
+                        await client.send_message(
+                            'me',
+                            f"🎯 **РАБОЧАЯ ССЫЛКА #{total_found}!**\n\n"
+                            f"🔗 `{link}`\n\n"
+                            f"📊 Проверено: {checked_count}\n"
+                            f"✅ Найдено: {total_found}\n"
+                            f"⚡ Скорость: {get_speed():.1f} ссылок/сек"
                         )
-                    except Exception:
-                        pass
-
-        except FloodWaitError as error:
-            await asyncio.sleep(error.seconds)
-            return await export_chat(target, progress)
-
-    return split_file(output)
-
-
-@router.message(CommandStart())
-async def start(message: Message):
-    if not message.from_user:
-        return
-
-    if not is_allowed(message.from_user.id):
-        await message.answer("Доступ запрещён.")
-        return
-
-    authorized = await telegram_client.is_user_authorized()
-
-    status = (
-        "Пользовательский аккаунт подключён."
-        if authorized
-        else "Пользовательский аккаунт не подключён."
-    )
-
-    await message.answer(
-        f"{status}\n\n"
-        "Команды:\n"
-        "/login — войти в Telegram-аккаунт\n"
-        "/status — проверить авторизацию\n"
-        "/logout — выйти из пользовательского аккаунта\n"
-        "/export @username — выгрузить чат\n"
-        "/cancel — отменить текущую операцию"
-    )
-
-
-@router.message(Command("status"))
-async def status_command(message: Message):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    authorized = await telegram_client.is_user_authorized()
-
-    if not authorized:
-        await message.answer(
-            "Пользовательский аккаунт не авторизован.\n"
-            "Используйте /login."
-        )
-        return
-
-    me = await telegram_client.get_me()
-
-    name = " ".join(
-        part
-        for part in [
-            getattr(me, "first_name", None),
-            getattr(me, "last_name", None),
-        ]
-        if part
-    ).strip()
-
-    username = getattr(me, "username", None)
-
-    await message.answer(
-        "Аккаунт подключён.\n\n"
-        f"Имя: {name or 'не указано'}\n"
-        f"Username: @{username}" if username else
-        "Аккаунт подключён.\n\n"
-        f"Имя: {name or 'не указано'}\n"
-        "Username: не указан"
-    )
-
-
-@router.message(Command("login"))
-async def login_command(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    if await telegram_client.is_user_authorized():
-        await message.answer(
-            "Пользовательский аккаунт уже авторизован."
-        )
-        return
-
-    await state.clear()
-    await state.set_state(LoginStates.waiting_phone)
-
-    await message.answer(
-        "Отправьте номер телефона пользовательского "
-        "Telegram-аккаунта в международном формате.\n\n"
-        "Пример: +79991234567"
-    )
-
-
-@router.message(LoginStates.waiting_phone, F.text)
-async def login_phone(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    phone = message.text.strip().replace(" ", "")
-
-    if not re.fullmatch(r"\+\d{8,15}", phone):
-        await message.answer(
-            "Неверный формат номера.\n"
-            "Пример: +79991234567"
-        )
-        return
-
-    try:
-        sent = await telegram_client.send_code_request(phone)
-
-        await state.update_data(
-            phone=phone,
-            phone_code_hash=sent.phone_code_hash,
-        )
-        await state.set_state(LoginStates.waiting_code)
-
-        await message.answer(
-            "Код отправлен в Telegram.\n\n"
-            "Отправьте код одним сообщением.\n"
-            "Можно написать цифры через пробел, например: 1 2 3 4 5"
-        )
-
-    except PhoneNumberInvalidError:
-        await message.answer("Telegram считает этот номер неверным.")
-    except FloodWaitError as error:
-        await message.answer(
-            f"Слишком много попыток. Повторите через "
-            f"{error.seconds} секунд."
-        )
-    except Exception as error:
-        logger.exception("Ошибка отправки кода")
-        await message.answer(
-            f"Ошибка: {type(error).__name__}: {error}"
-        )
-
-
-@router.message(LoginStates.waiting_code, F.text)
-async def login_code(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    code = re.sub(r"\D", "", message.text)
-    data = await state.get_data()
-
-    phone = data.get("phone")
-    phone_code_hash = data.get("phone_code_hash")
-
-    if not phone or not phone_code_hash:
-        await state.clear()
-        await message.answer(
-            "Данные авторизации потеряны. Начните заново: /login"
-        )
-        return
-
-    try:
-        await telegram_client.sign_in(
-            phone=phone,
-            code=code,
-            phone_code_hash=phone_code_hash,
-        )
-
-        await state.clear()
-        await message.answer(
-            "Готово. Пользовательский Telegram-аккаунт подключён."
-        )
-
-    except SessionPasswordNeededError:
-        await state.set_state(LoginStates.waiting_password)
-        await message.answer(
-            "На аккаунте включена двухэтапная аутентификация.\n\n"
-            "Отправьте пароль 2FA."
-        )
-
-    except PhoneCodeInvalidError:
-        await message.answer(
-            "Неверный код. Попробуйте ещё раз."
-        )
-
-    except PhoneCodeExpiredError:
-        await state.clear()
-        await message.answer(
-            "Срок действия кода истёк.\n"
-            "Начните заново: /login"
-        )
-
-    except Exception as error:
-        logger.exception("Ошибка входа по коду")
-        await message.answer(
-            f"Ошибка: {type(error).__name__}: {error}"
-        )
-
-
-@router.message(LoginStates.waiting_password, F.text)
-async def login_password(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    password = message.text
-
-    try:
-        await telegram_client.sign_in(password=password)
-
-        await state.clear()
-        await message.answer(
-            "Готово. Пользовательский Telegram-аккаунт подключён."
-        )
-
-        try:
-            await message.delete()
-        except Exception:
-            pass
-
-    except Exception as error:
-        logger.exception("Ошибка пароля 2FA")
-        await message.answer(
-            "Не удалось войти.\n"
-            f"Ошибка: {type(error).__name__}: {error}"
-        )
-
-
-@router.message(Command("logout"))
-async def logout_command(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    await state.clear()
-
-    if not await telegram_client.is_user_authorized():
-        await message.answer("Аккаунт уже отключён.")
-        return
-
-    await telegram_client.log_out()
-    await message.answer(
-        "Пользовательский аккаунт отключён.\n"
-        "Для повторного входа используйте /login."
-    )
-
-
-@router.message(Command("cancel"))
-async def cancel_command(message: Message, state: FSMContext):
-    if not message.from_user or not is_allowed(message.from_user.id):
-        return
-
-    await state.clear()
-    await message.answer("Текущая операция отменена.")
-
-
-@router.message(Command("export"))
-async def export_command(message: Message):
-    if not message.from_user:
-        return
-
-    if not is_allowed(message.from_user.id):
-        await message.answer("Доступ запрещён.")
-        return
-
-    if not await telegram_client.is_user_authorized():
-        await message.answer(
-            "Сначала подключите пользовательский аккаунт: /login"
-        )
-        return
-
-    args = message.text.split(maxsplit=1) if message.text else []
-
-    if len(args) < 2:
-        await message.answer(
-            "Укажите чат после команды.\n\n"
-            "Пример:\n"
-            "/export @username"
-        )
-        return
-
-    target = args[1].strip()
-
-    lock = export_locks.setdefault(
-        message.from_user.id,
-        asyncio.Lock(),
-    )
-
-    if lock.locked():
-        await message.answer(
-            "Для вас уже выполняется выгрузка."
-        )
-        return
-
-    async with lock:
-        progress = await message.answer(
-            "Начинаю выгрузку…"
-        )
-
-        paths: list[Path] = []
-
-        try:
-            paths = await export_chat(target, progress)
-
-            await progress.edit_text(
-                "Выгрузка завершена. Отправляю файл…"
-            )
-
-            for file_path in paths:
-                await message.answer_document(
-                    FSInputFile(file_path),
-                    caption=f"Готово: {file_path.name}",
+                    except Exception as e:
+                        logger.error(f"Ошибка отправки уведомления: {e}")
+            
+            # Если найдены ссылки в этом пакете, показываем статистику
+            if found_in_batch:
+                logger.info(f"{Fore.GREEN}✅ Найдено {len(found_in_batch)} ссылок в пакете!")
+                found_in_batch = []
+            
+            # Обновляем статус каждые 100 проверок
+            if checked_count % 100 == 0:
+                speed = get_speed()
+                logger.info(
+                    f"{Fore.CYAN}📊 Статус: {checked_count} проверок | "
+                    f"{Fore.GREEN}{total_found} найдено | "
+                    f"{Fore.YELLOW}{speed:.1f} ссылок/сек"
                 )
+            
+            # Маленькая задержка между пакетами
+            await asyncio.sleep(MIN_DELAY)
+            
+        except Exception as e:
+            error_count += 1
+            logger.error(f"{Fore.RED}❌ Ошибка в поиске: {e}")
+            await asyncio.sleep(0.5)
 
-            await progress.delete()
+# ===== ОБРАБОТЧИКИ КОМАНД =====
+@client.on(events.NewMessage(pattern='/start'))
+async def start_command(event):
+    await event.reply(
+        f"{Fore.CYAN}🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
+        f"{Fore.GREEN}📌 **Команды:**\n"
+        f"/start - Показать это сообщение\n"
+        f"/search - Запустить поиск (МАКСИМАЛЬНАЯ СКОРОСТЬ)\n"
+        f"/stop - Остановить поиск\n"
+        f"/status - Статистика\n"
+        f"/found - Показать найденные ссылки\n"
+        f"/clear - Очистить найденные ссылки\n"
+        f"/restart - Перезапустить бота\n\n"
+        f"{Fore.YELLOW}⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}\n"
+        f"📦 Размер пакета: {BATCH_SIZE}"
+    )
 
-        except Exception as error:
-            logger.exception("Ошибка выгрузки")
+@client.on(events.NewMessage(pattern='/search'))
+async def start_search(event):
+    global is_searching, search_task, start_time
+    
+    if is_searching:
+        await event.reply("⚠️ Поиск уже запущен! Используйте /stop для остановки.")
+        return
+    
+    is_searching = True
+    start_time = time.time()
+    
+    await event.reply(
+        f"🚀 **Поиск запущен!**\n\n"
+        f"⚡ Скорость: МАКСИМАЛЬНАЯ\n"
+        f"🔄 Параллельных потоков: {MAX_CONCURRENT_CHECKS}\n"
+        f"📦 Размер пакета: {BATCH_SIZE}\n\n"
+        f"📊 Для просмотра статистики используйте /status\n"
+        f"📌 Найденные ссылки будут отправлены в 'Сохраненные сообщения'"
+    )
+    
+    # Запускаем поиск в фоне
+    search_task = asyncio.create_task(search_worker())
 
-            await progress.edit_text(
-                "Не удалось выгрузить чат.\n\n"
-                f"Ошибка: {type(error).__name__}: {error}"
-            )
+@client.on(events.NewMessage(pattern='/stop'))
+async def stop_search(event):
+    global is_searching, search_task
+    
+    if not is_searching:
+        await event.reply("⚠️ Поиск не запущен.")
+        return
+    
+    is_searching = False
+    
+    if search_task:
+        search_task.cancel()
+        try:
+            await search_task
+        except asyncio.CancelledError:
+            pass
+        search_task = None
+    
+    elapsed = get_elapsed()
+    speed = get_speed()
+    
+    await event.reply(
+        f"⏹ **Поиск остановлен!**\n\n"
+        f"📊 **Итог:**\n"
+        f"🔍 Проверено: {checked_count}\n"
+        f"✅ Найдено: {total_found}\n"
+        f"⏱ Время: {elapsed:.1f} сек\n"
+        f"🚀 Скорость: {speed:.1f} ссылок/сек\n"
+        f"❌ Ошибок: {error_count}"
+    )
 
-        finally:
-            for file_path in paths:
-                file_path.unlink(missing_ok=True)
+@client.on(events.NewMessage(pattern='/status'))
+async def show_status(event):
+    if not is_searching:
+        await event.reply("⚠️ Поиск не запущен. Используйте /search для запуска.")
+        return
+    
+    elapsed = get_elapsed()
+    speed = get_speed()
+    
+    status_text = (
+        f"📊 **Статистика поиска:**\n\n"
+        f"🔄 Статус: {'🟢 Активен' if is_searching else '🔴 Остановлен'}\n"
+        f"🔍 Проверено: {checked_count}\n"
+        f"✅ Найдено: {total_found}\n"
+        f"📈 Процент: {(total_found/checked_count*100):.2f}%\n"
+        f"⚡ Скорость: {speed:.1f} ссылок/сек\n"
+        f"⏱ Время: {elapsed:.1f} сек\n"
+        f"❌ Ошибок: {error_count}\n"
+        f"🔄 Потоков: {MAX_CONCURRENT_CHECKS}\n\n"
+    )
+    
+    if found_links:
+        last = found_links[-1]
+        status_text += f"📝 Последняя найденная:\n`{last['link']}`\n⏱ {last['time']}"
+    else:
+        status_text += "📝 Нет находок"
+    
+    await event.reply(status_text)
 
+@client.on(events.NewMessage(pattern='/found'))
+async def show_found_links(event):
+    if not found_links:
+        await event.reply("❌ Пока не найдено ни одной рабочей ссылки.")
+        return
+    
+    # Показываем последние 5 ссылок
+    last_links = found_links[-5:]
+    links_text = "\n\n".join([
+        f"#{i+1} `{item['link']}`\n   ⏱ {item['time']} | Попытка #{item['attempt']}"
+        for i, item in enumerate(last_links)
+    ])
+    
+    await event.reply(
+        f"✅ **Найдено ссылок: {len(found_links)}**\n\n"
+        f"📌 Последние 5:\n{links_text}\n\n"
+        f"💾 Все ссылки сохранены в памяти бота"
+    )
 
+@client.on(events.NewMessage(pattern='/clear'))
+async def clear_found(event):
+    global found_links, total_found
+    count = len(found_links)
+    found_links = []
+    total_found = 0
+    await event.reply(f"🧹 Очищено {count} найденных ссылок.")
+
+@client.on(events.NewMessage(pattern='/restart'))
+async def restart_bot(event):
+    await event.reply("🔄 Перезапуск бота...")
+    logger.info("Перезапуск бота...")
+    await client.disconnect()
+    await asyncio.sleep(1)
+    await client.start()
+    logger.info("✅ Бот перезапущен!")
+
+# ===== ЗАПУСК =====
 async def main():
-    await telegram_client.connect()
-
-    bot = Bot(BOT_TOKEN)
-    dispatcher = Dispatcher(storage=MemoryStorage())
-    dispatcher.include_router(router)
-
     try:
-        await dispatcher.start_polling(bot)
+        print(f"{Fore.GREEN}🚀 ULTRA SPEED BOT STARTED!")
+        print(f"{Fore.CYAN}⚡ Concurrent checks: {MAX_CONCURRENT_CHECKS}")
+        print(f"{Fore.CYAN}📦 Batch size: {BATCH_SIZE}")
+        print(f"{Fore.YELLOW}💡 Используйте /search для запуска поиска")
+        print(f"{Fore.MAGENTA}📌 Бот @{BOT_TOKEN.split(':')[0]} запущен!")
+        
+        await client.start()
+        await client.run_until_disconnected()
+    except Exception as e:
+        logger.error(f"{Fore.RED}❌ Критическая ошибка: {e}")
     finally:
-        await bot.session.close()
-        await telegram_client.disconnect()
+        await client.disconnect()
 
-
-if __name__ == "__main__":
-    asyncio.run(main())
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print(f"\n{Fore.YELLOW}👋 Бот остановлен пользователем")
