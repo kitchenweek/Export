@@ -5,7 +5,7 @@ import string
 import time
 from datetime import datetime
 import logging
-import sys
+import os
 
 # Настройка логирования
 logging.basicConfig(
@@ -18,17 +18,20 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГУРАЦИЯ =====
 API_ID = 36658004
 API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
+
+# Токен бота (для команд)
 BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
 
 # Настройки скорости
-MAX_CONCURRENT_CHECKS = 10  # Уменьшил для стабильности
-BATCH_SIZE = 30
+MAX_CONCURRENT_CHECKS = 5  # Меньше для стабильности с пользовательским аккаунтом
+BATCH_SIZE = 20
 CHECK_TIMEOUT = 1.5
-MIN_DELAY = 0.1
+MIN_DELAY = 0.2
 
 # ===== ИНИЦИАЛИЗАЦИЯ КЛИЕНТА =====
+# Создаем клиент с сессией пользователя
 client = TelegramClient(
-    'ultra_bot_session',
+    'user_session',  # Сессия пользователя
     API_ID,
     API_HASH,
     connection_retries=3,
@@ -77,7 +80,7 @@ async def check_link_fast(link):
     """Быстрая проверка ссылки через @send"""
     try:
         async with rate_limiter:
-            # Отправляем ссылку
+            # Отправляем ссылку от имени пользователя
             await client.send_message(SEND_BOT_USERNAME, link)
             
             # Минимальная задержка для получения ответа
@@ -151,7 +154,7 @@ async def search_worker():
                     logger.info(f"🔗 {link}")
                     logger.info(f"📊 Проверено: {checked_count} | Найдено: {total_found}")
                     
-                    # Отправляем в Telegram
+                    # Отправляем в Telegram (в сохраненные сообщения)
                     try:
                         await client.send_message(
                             'me',
@@ -315,17 +318,20 @@ async def clear_found(event):
 # ===== ЗАПУСК =====
 async def main():
     try:
-        print("🚀 ULTRA SPEED BOT STARTED!")
-        print(f"⚡ Concurrent checks: {MAX_CONCURRENT_CHECKS}")
-        print(f"📦 Batch size: {BATCH_SIZE}")
+        print("🚀 ULTRA SPEED BOT WITH USER ACCOUNT!")
+        print("⚡ Для работы нужен аккаунт пользователя!")
+        print("📌 Бот будет обрабатывать команды")
         print("💡 Используйте /search для запуска поиска")
-        print(f"📌 Бот запущен!")
         
-        # Запускаем клиент
-        await client.start(bot_token=BOT_TOKEN)
-        print("✅ Бот успешно запущен!")
+        # Запускаем клиент с пользовательским аккаунтом
+        await client.start()
         
-        # Запускаем бесконечный цикл
+        # Получаем информацию о пользователе
+        me = await client.get_me()
+        print(f"✅ Авторизован как: {me.first_name} (@{me.username if me.username else 'нет username'})")
+        print(f"📱 ID: {me.id}")
+        
+        # Запускаем бота (обработка команд от бота)
         await client.run_until_disconnected()
         
     except KeyboardInterrupt:
@@ -335,13 +341,19 @@ async def main():
     finally:
         await client.disconnect()
 
-# Правильный способ запуска с одним event loop
+# ===== ТОЧКА ВХОДА =====
 if __name__ == '__main__':
     try:
-        # Создаем новый event loop и запускаем
+        # Создаем новый event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        
+        print("🔐 Авторизация пользователя...")
+        print("При первом запуске потребуется ввести номер телефона и код подтверждения")
+        print()
+        
         loop.run_until_complete(main())
+        
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
     except Exception as e:
