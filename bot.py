@@ -5,7 +5,6 @@ import string
 import time
 from datetime import datetime
 import logging
-import os
 
 # Настройка логирования
 logging.basicConfig(
@@ -18,20 +17,16 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГУРАЦИЯ =====
 API_ID = 36658004
 API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
-
-# Токен бота (для команд)
 BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
 
 # Настройки скорости
-MAX_CONCURRENT_CHECKS = 5  # Меньше для стабильности с пользовательским аккаунтом
+MAX_CONCURRENT_CHECKS = 5
 BATCH_SIZE = 20
-CHECK_TIMEOUT = 1.5
 MIN_DELAY = 0.2
 
 # ===== ИНИЦИАЛИЗАЦИЯ КЛИЕНТА =====
-# Создаем клиент с сессией пользователя
 client = TelegramClient(
-    'user_session',  # Сессия пользователя
+    'user_session',
     API_ID,
     API_HASH,
     connection_retries=3,
@@ -49,18 +44,19 @@ checked_count = 0
 start_time = None
 total_found = 0
 error_count = 0
+link_history = []
 
 # Семафор для контроля параллельных запросов
 rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
-# Предварительная генерация символов для скорости
+# ===== ФУНКЦИЯ ГЕНЕРАЦИИ ССЫЛОК С ПРЕФИКСОМ CQ + 10 СИМВОЛОВ =====
 CHARS = string.ascii_letters + string.digits
-LINK_TEMPLATE = "http://t.me/CryptoBot?start={}"
 
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 def generate_cryptobot_link():
-    """Максимально быстрая генерация ссылки"""
-    return LINK_TEMPLATE.format(''.join(random.choices(CHARS, k=14)))
+    """Генерирует ссылку с префиксом CQ и 10 случайными символами"""
+    prefix = "CQ"
+    random_part = ''.join(random.choices(CHARS, k=10))  # 10 символов
+    return f"http://t.me/CryptoBot?start={prefix}{random_part}"
 
 def get_speed():
     """Вычисляет скорость проверки"""
@@ -80,7 +76,7 @@ async def check_link_fast(link):
     """Быстрая проверка ссылки через @send"""
     try:
         async with rate_limiter:
-            # Отправляем ссылку от имени пользователя
+            # Отправляем ссылку
             await client.send_message(SEND_BOT_USERNAME, link)
             
             # Минимальная задержка для получения ответа
@@ -111,22 +107,24 @@ async def batch_check_links(links):
 
 async def search_worker():
     """Основной рабочий процесс поиска"""
-    global is_searching, checked_count, found_links, start_time, total_found, error_count
+    global is_searching, checked_count, found_links, start_time, total_found, error_count, link_history
     
     checked_count = 0
     found_links = []
+    link_history = []
     start_time = time.time()
     batch = []
     found_in_batch = []
     
-    logger.info(f"🚀 Поиск запущен! Скорость: МАКСИМАЛЬНАЯ")
+    logger.info(f"🚀 Поиск запущен! Генерация ссылок с префиксом CQ + 10 символов")
     logger.info(f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}")
     logger.info(f"📦 Размер пакета: {BATCH_SIZE}")
     
     while is_searching:
         try:
-            # Генерируем пакет ссылок
+            # Генерируем пакет ссылок с префиксом CQ + 10 символов
             batch = [generate_cryptobot_link() for _ in range(BATCH_SIZE)]
+            link_history.extend(batch)
             
             # Проверяем пакет
             results = await batch_check_links(batch)
@@ -154,7 +152,7 @@ async def search_worker():
                     logger.info(f"🔗 {link}")
                     logger.info(f"📊 Проверено: {checked_count} | Найдено: {total_found}")
                     
-                    # Отправляем в Telegram (в сохраненные сообщения)
+                    # Отправляем в Telegram
                     try:
                         await client.send_message(
                             'me',
@@ -189,20 +187,94 @@ async def search_worker():
             logger.error(f"❌ Ошибка в поиске: {e}")
             await asyncio.sleep(0.5)
 
-# ===== ОБРАБОТЧИКИ КОМАНД =====
+# ===== КОМАНДА ДЛЯ ГЕНЕРАЦИИ ССЫЛОК =====
+@client.on(events.NewMessage(pattern='/generate'))
+async def generate_links(event):
+    """Генерирует и показывает ссылки с префиксом CQ + 10 символов"""
+    parts = event.message.text.split()
+    count = 10
+    if len(parts) > 1:
+        try:
+            count = min(int(parts[1]), 50)
+        except:
+            count = 10
+    
+    # Генерируем ссылки
+    links = []
+    for _ in range(count):
+        links.append(generate_cryptobot_link())
+    
+    # Формируем ответ
+    response = f"🔗 **Сгенерировано {count} ссылок (CQ + 10 символов):**\n\n"
+    for i, link in enumerate(links, 1):
+        # Показываем длину после CQ
+        after_cq = link.split('start=CQ')[1] if 'start=CQ' in link else ''
+        response += f"{i}. `{link}`\n"
+        response += f"   📝 После CQ: `{after_cq}` (10 символов)\n\n"
+    
+    response += f"💡 Используйте /search для начала проверки"
+    
+    await event.reply(response)
+
+# ===== КОМАНДА ДЛЯ ПРОВЕРКИ КОНКРЕТНОЙ ССЫЛКИ =====
+@client.on(events.NewMessage(pattern='/check'))
+async def check_specific_link(event):
+    """Проверяет конкретную ссылку"""
+    parts = event.message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await event.reply("❌ Укажите ссылку: /check http://t.me/CryptoBot?start=CQ...")
+        return
+    
+    link = parts[1].strip()
+    
+    # Проверяем формат
+    if not link.startswith('http://t.me/CryptoBot?start=CQ'):
+        await event.reply("❌ Ссылка должна начинаться с: http://t.me/CryptoBot?start=CQ")
+        return
+    
+    # Проверяем длину после CQ
+    after_cq = link.split('start=CQ')[1] if 'start=CQ' in link else ''
+    if len(after_cq) != 10:
+        await event.reply(f"❌ После CQ должно быть 10 символов, а у вас {len(after_cq)}")
+        return
+    
+    status_msg = await event.reply(f"🔍 Проверяю ссылку: `{link}`")
+    
+    result = await check_link_fast(link)
+    
+    if result[0]:
+        await status_msg.edit(
+            f"✅ **Ссылка рабочая!**\n\n"
+            f"🔗 `{link}`\n\n"
+            f"📊 Результат: {result[1]}\n"
+            f"📝 После CQ: `{after_cq}` (10 символов)"
+        )
+    else:
+        await status_msg.edit(
+            f"❌ **Ссылка не работает**\n\n"
+            f"🔗 `{link}`\n\n"
+            f"📊 Результат: {result[1]}\n"
+            f"📝 После CQ: `{after_cq}` (10 символов)"
+        )
+
+# ===== ОСТАЛЬНЫЕ КОМАНДЫ =====
 @client.on(events.NewMessage(pattern='/start'))
 async def start_command(event):
     await event.reply(
         f"🚀 **Ultra Speed Bot - CryptoBot Checker**\n\n"
         f"📌 **Команды:**\n"
         f"/start - Показать это сообщение\n"
+        f"/generate [количество] - Сгенерировать CQ + 10 символов ссылки\n"
+        f"/check <ссылка> - Проверить конкретную ссылку\n"
         f"/search - Запустить поиск (МАКСИМАЛЬНАЯ СКОРОСТЬ)\n"
         f"/stop - Остановить поиск\n"
         f"/status - Статистика\n"
         f"/found - Показать найденные ссылки\n"
         f"/clear - Очистить найденные ссылки\n\n"
         f"⚡ Параллельных проверок: {MAX_CONCURRENT_CHECKS}\n"
-        f"📦 Размер пакета: {BATCH_SIZE}"
+        f"📦 Размер пакета: {BATCH_SIZE}\n"
+        f"🔗 Формат: CQ + 10 символов\n"
+        f"📝 Пример: `http://t.me/CryptoBot?start=CQxK7mP9rT2`"
     )
 
 @client.on(events.NewMessage(pattern='/search'))
@@ -218,6 +290,7 @@ async def start_search(event):
     
     await event.reply(
         f"🚀 **Поиск запущен!**\n\n"
+        f"🔗 Генерация ссылок: CQ + 10 символов\n"
         f"⚡ Скорость: МАКСИМАЛЬНАЯ\n"
         f"🔄 Параллельных потоков: {MAX_CONCURRENT_CHECKS}\n"
         f"📦 Размер пакета: {BATCH_SIZE}\n\n"
@@ -225,7 +298,6 @@ async def start_search(event):
         f"📌 Найденные ссылки будут отправлены в 'Сохраненные сообщения'"
     )
     
-    # Запускаем поиск в фоне
     search_task = asyncio.create_task(search_worker())
 
 @client.on(events.NewMessage(pattern='/stop'))
@@ -294,7 +366,6 @@ async def show_found_links(event):
         await event.reply("❌ Пока не найдено ни одной рабочей ссылки.")
         return
     
-    # Показываем последние 5 ссылок
     last_links = found_links[-5:]
     links_text = "\n\n".join([
         f"#{i+1} `{item['link']}`\n   ⏱ {item['time']} | Попытка #{item['attempt']}"
@@ -318,20 +389,15 @@ async def clear_found(event):
 # ===== ЗАПУСК =====
 async def main():
     try:
-        print("🚀 ULTRA SPEED BOT WITH USER ACCOUNT!")
-        print("⚡ Для работы нужен аккаунт пользователя!")
-        print("📌 Бот будет обрабатывать команды")
+        print("🚀 ULTRA SPEED BOT WITH CQ + 10 CHARACTERS!")
+        print("🔗 Генерация ссылок: CQ + 10 случайных символов")
+        print("📌 Команды доступны в боте")
+        print("💡 Используйте /generate для просмотра ссылок")
         print("💡 Используйте /search для запуска поиска")
         
-        # Запускаем клиент с пользовательским аккаунтом
-        await client.start()
+        await client.start(bot_token=BOT_TOKEN)
+        print("✅ Бот успешно запущен!")
         
-        # Получаем информацию о пользователе
-        me = await client.get_me()
-        print(f"✅ Авторизован как: {me.first_name} (@{me.username if me.username else 'нет username'})")
-        print(f"📱 ID: {me.id}")
-        
-        # Запускаем бота (обработка команд от бота)
         await client.run_until_disconnected()
         
     except KeyboardInterrupt:
@@ -341,19 +407,11 @@ async def main():
     finally:
         await client.disconnect()
 
-# ===== ТОЧКА ВХОДА =====
 if __name__ == '__main__':
     try:
-        # Создаем новый event loop
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        
-        print("🔐 Авторизация пользователя...")
-        print("При первом запуске потребуется ввести номер телефона и код подтверждения")
-        print()
-        
         loop.run_until_complete(main())
-        
     except KeyboardInterrupt:
         print("\n👋 Бот остановлен")
     except Exception as e:
