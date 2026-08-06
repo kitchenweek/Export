@@ -1,651 +1,1512 @@
-from telethon import TelegramClient, events
 import asyncio
-import random
-import string
-import time
-from datetime import datetime
+import html
 import logging
 import re
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
 
-# Настройка логирования
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+from telethon import TelegramClient, errors, types
+from telethon.sessions import StringSession
+
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
+
+API_ID = 32200104
+API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
+BOT_TOKEN = "8961878352:AAGcRX9m6VHWTjdzf9R0NZmfi5f8uCIMVGQ"
+
+# Укажите свой Telegram ID
+ADMIN_ID = 123456789
+
+BASE_DIR = Path(__file__).resolve().parent
+SESSION_FILE = BASE_DIR / "telethon_session.txt"
+
+MAX_POSTS = 100
+CHANNELS_PER_PAGE = 8
+CHANNEL_TIMEZONE = ZoneInfo("Europe/Moscow")
+
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+
 logger = logging.getLogger(__name__)
 
-# ===== КОНФИГУРАЦИЯ =====
-API_ID = 36658004
-API_HASH = '99c5c1f4bad289e77d4e9e6149d634bc'
-BOT_TOKEN = '8900018990:AAFhiQmako8YNwmKKiibkiXtOna2c-GlZig'
+router = Router()
+storage = MemoryStorage()
 
-# ===== ОПТИМАЛЬНЫЕ НАСТРОЙКИ =====
-MAX_CONCURRENT_CHECKS = 1
-BATCH_SIZE = 2
-CHECK_DELAY = 5.0
-ACTIVATION_DELAY = 4.0
-BETWEEN_BATCHES = 3.0
-MAX_RETRIES = 3
-
-# ===== СОЗДАЕМ КЛИЕНТА БОТА =====
-bot_client = TelegramClient(
-    'bot_session',
-    API_ID,
-    API_HASH
+bot = Bot(
+    token=BOT_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 
-# ===== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ =====
-SEND_BOT_USERNAME = '@send'
-CRYPTOBOT_USERNAME = 'CryptoBot'
-is_searching = False
-search_task = None
-activated_links = []
-checked_count = 0
-start_time = None
-total_activated = 0
-error_count = 0
-processed_links = set()
-flood_wait_active = False
+dp = Dispatcher(storage=storage)
+dp.include_router(router)
 
-# Данные пользователя
-user_phone = None
-is_authorized = False
-user_client = None
-rate_limiter = None
+telethon_client: TelegramClient | None = None
+telethon_lock = asyncio.Lock()
 
-# ===== ФУНКЦИЯ ГЕНЕРАЦИИ ССЫЛОК =====
-CHARS = string.ascii_letters + string.digits
 
-def generate_cryptobot_link():
-    """Генерирует ссылку с префиксом CQ и 10 случайными символами"""
-    prefix = "CQ"
-    random_part = ''.join(random.choices(CHARS, k=10))
-    return f"http://t.me/CryptoBot?start={prefix}{random_part}"
+# ============================================================
+# СОСТОЯНИЯ
+# ============================================================
 
-def extract_start_param(link):
-    """Извлекает параметр start из ссылки (только CQ...)"""
-    if 'start=' in link:
-        return link.split('start=')[1].strip()
-    return None
+class AuthorizationStates(StatesGroup):
+    waiting_phone = State()
+    waiting_code = State()
+    waiting_password = State()
 
-def get_speed():
-    """Вычисляет скорость проверки"""
-    if start_time and checked_count > 0:
-        elapsed = time.time() - start_time
-        return checked_count / elapsed if elapsed > 0 else 0
-    return 0
 
-def get_elapsed():
-    """Возвращает прошедшее время"""
-    if start_time:
-        return time.time() - start_time
-    return 0
+class ReplacementStates(StatesGroup):
+    choosing_channel = State()
+    waiting_dates = State()
+    collecting_posts = State()
+    confirmation = State()
+    processing = State()
 
-# ===== ФУНКЦИИ АВТОРИЗАЦИИ =====
-async def start_auth(phone):
-    """Начинает процесс авторизации"""
-    global user_client, is_authorized, user_phone, rate_limiter
-    
+
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔐 Авторизация")],
+            [KeyboardButton(text="📝 Заменить посты")],
+            [KeyboardButton(text="👤 Статус аккаунта")],
+            [KeyboardButton(text="🚪 Выйти из аккаунта")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие",
+    )
+
+
+def phone_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📱 Отправить номер", request_contact=True)],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+def collection_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Готово")],
+            [KeyboardButton(text="🗑 Очистить посты")],
+            [KeyboardButton(text="❌ Отмена")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+def confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Начать замену",
+                    callback_data="replace:confirm",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data="replace:cancel",
+                )
+            ],
+        ]
+    )
+
+
+# ============================================================
+# ПРОВЕРКА ДОСТУПА
+# ============================================================
+
+def is_admin(user_id: int | None) -> bool:
+    return user_id == ADMIN_ID
+
+
+async def reject_non_admin_message(message: Message) -> bool:
+    if is_admin(message.from_user.id if message.from_user else None):
+        return False
+
+    await message.answer("⛔ У вас нет доступа к этому боту.")
+    return True
+
+
+async def reject_non_admin_callback(callback: CallbackQuery) -> bool:
+    if is_admin(callback.from_user.id):
+        return False
+
+    await callback.answer("У вас нет доступа.", show_alert=True)
+    return True
+
+
+# ============================================================
+# TELETHON
+# ============================================================
+
+def load_string_session() -> str:
+    if not SESSION_FILE.exists():
+        return ""
+
     try:
-        user_phone = phone
-        session_name = f"user_{phone.replace('+', '')}"
-        
-        user_client = TelegramClient(
-            session_name,
-            API_ID,
-            API_HASH,
-            connection_retries=5,
-            retry_delay=2,
-            auto_reconnect=True,
-            flood_sleep_threshold=120
+        return SESSION_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        logger.exception("Не удалось прочитать файл сессии")
+        return ""
+
+
+def save_string_session(session_string: str) -> None:
+    SESSION_FILE.write_text(session_string, encoding="utf-8")
+
+
+def delete_session_file() -> None:
+    try:
+        SESSION_FILE.unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Не удалось удалить файл сессии")
+
+
+async def create_telethon_client() -> TelegramClient:
+    session_string = load_string_session()
+
+    client = TelegramClient(
+        StringSession(session_string),
+        API_ID,
+        API_HASH,
+        device_model="Channel Post Editor",
+        system_version="Python",
+        app_version="1.0",
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
+
+    await client.connect()
+    return client
+
+
+async def get_telethon_client() -> TelegramClient:
+    global telethon_client
+
+    async with telethon_lock:
+        if telethon_client is None:
+            telethon_client = await create_telethon_client()
+        elif not telethon_client.is_connected():
+            await telethon_client.connect()
+
+        return telethon_client
+
+
+async def recreate_telethon_client() -> TelegramClient:
+    global telethon_client
+
+    async with telethon_lock:
+        if telethon_client is not None:
+            try:
+                await telethon_client.disconnect()
+            except Exception:
+                logger.exception("Ошибка отключения Telethon")
+
+        telethon_client = await create_telethon_client()
+        return telethon_client
+
+
+async def save_current_telethon_session(client: TelegramClient) -> None:
+    session_string = client.session.save()
+
+    if not isinstance(session_string, str) or not session_string:
+        raise RuntimeError("Не удалось получить строку сессии Telethon")
+
+    save_string_session(session_string)
+
+
+# ============================================================
+# ДАТЫ
+# ============================================================
+
+DATE_PATTERN = re.compile(r"(?<!\d)(\d{2}\.\d{2}\.\d{4})(?!\d)")
+
+
+def parse_dates(text: str) -> list[datetime]:
+    found_dates: set[datetime] = set()
+    invalid_dates: list[str] = []
+
+    for value in DATE_PATTERN.findall(text):
+        try:
+            parsed = datetime.strptime(value, "%d.%m.%Y")
+            found_dates.add(parsed)
+        except ValueError:
+            invalid_dates.append(value)
+
+    if invalid_dates:
+        raise ValueError(
+            "Некорректные даты: " + ", ".join(sorted(set(invalid_dates)))
         )
-        
-        await user_client.connect()
-        
-        if await user_client.is_user_authorized():
-            is_authorized = True
-            me = await user_client.get_me()
-            rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
-            return True, f"✅ Уже авторизован как {me.first_name}"
-        
-        await user_client.send_code_request(phone)
-        return False, "📱 Код подтверждения отправлен в Telegram"
-        
-    except Exception as e:
-        logger.error(f"Ошибка авторизации: {e}")
-        return False, f"❌ Ошибка: {str(e)}"
 
-async def complete_auth(code):
-    """Завершает авторизацию с кодом"""
-    global is_authorized, rate_limiter
-    
-    try:
-        await user_client.sign_in(user_phone, code)
-        is_authorized = True
-        me = await user_client.get_me()
-        rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
-        return True, f"✅ Авторизация успешна! {me.first_name}"
-    except Exception as e:
-        error = str(e)
-        if 'password' in error.lower():
-            return False, "🔑 Требуется пароль 2FA. Используйте /setpassword <пароль>"
-        return False, f"❌ Ошибка: {error}"
+    if not found_dates:
+        raise ValueError(
+            "Даты не найдены. Используйте формат ДД.ММ.ГГГГ."
+        )
 
-async def complete_auth_with_password(password):
-    """Завершает авторизацию с паролем 2FA"""
-    global is_authorized, rate_limiter
-    
-    try:
-        await user_client.sign_in(password=password)
-        is_authorized = True
-        me = await user_client.get_me()
-        rate_limiter = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
-        return True, f"✅ Авторизация успешна! {me.first_name}"
-    except Exception as e:
-        return False, f"❌ Ошибка: {str(e)}"
+    return sorted(found_dates)
 
-async def logout_user():
-    """Выход из аккаунта"""
-    global user_client, is_authorized
-    
-    if user_client:
-        try:
-            await user_client.disconnect()
-        except:
-            pass
-        user_client = None
-        is_authorized = False
-        return True, "✅ Выход выполнен"
-    return False, "❌ Не авторизован"
 
-# ===== БЕЗОПАСНАЯ ОТПРАВКА =====
-async def safe_send_message(client, entity, message):
-    """Безопасная отправка сообщения с обработкой flood wait"""
-    global flood_wait_active
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            await client.send_message(entity, message)
-            return True, None
-        except Exception as e:
-            error = str(e)
-            if 'flood' in error.lower() or 'wait' in error.lower():
-                import re
-                wait_time = 60
-                match = re.search(r'wait for (\d+)', error)
-                if match:
-                    wait_time = int(match.group(1)) + 5
-                elif re.search(r'(\d+) seconds', error):
-                    wait_time = int(re.search(r'(\d+) seconds', error).group(1)) + 5
-                
-                flood_wait_active = True
-                logger.warning(f"⏳ Flood wait {wait_time} сек...")
-                
-                for i in range(int(wait_time), 0, -5):
-                    logger.info(f"⏳ Ожидание {i} сек...")
-                    await asyncio.sleep(5)
-                
-                flood_wait_active = False
-                continue
-            else:
-                return False, str(e)
-    
-    return False, "Превышено количество попыток"
+def format_dates(dates: list[str] | list[datetime]) -> str:
+    result: list[str] = []
 
-# ===== ФУНКЦИЯ АКТИВАЦИИ ССЫЛКИ (ПРАВИЛЬНЫЙ ФОРМАТ) =====
-async def activate_link(link):
-    """Активирует ссылку - отправляет /start CQ... в CryptoBot"""
-    try:
-        # Извлекаем только параметр start (CQ...)
-        start_param = extract_start_param(link)
-        
-        if not start_param:
-            return False, "❌ Нет параметра start"
-        
-        # Формируем команду ТОЛЬКО с параметром
-        command = f"/start {start_param}"
-        
-        logger.info(f"🔗 Активирую ссылку: {link}")
-        logger.info(f"📝 Отправляю команду: {command}")
-        logger.info(f"📤 В бота: {CRYPTOBOT_USERNAME}")
-        
-        # Отправляем команду в CryptoBot
-        success, error = await safe_send_message(user_client, CRYPTOBOT_USERNAME, command)
-        
-        if not success:
-            return False, f"❌ Ошибка отправки: {error}"
-        
-        logger.info(f"✅ Отправлено: {command}")
-        
-        # Ждем ответ от бота
-        await asyncio.sleep(ACTIVATION_DELAY)
-        
-        # Получаем последние сообщения от CryptoBot
-        responses = []
-        async for msg in user_client.iter_messages(CRYPTOBOT_USERNAME, limit=5):
-            if msg.text and len(msg.text) > 3:
-                responses.append(msg.text)
-                logger.info(f"📩 Ответ: {msg.text[:100]}...")
-        
-        if not responses:
-            return False, "❌ Нет ответа от CryptoBot"
-        
-        # Проверяем ответы на успешность
-        for response in responses:
-            text_lower = response.lower()
-            
-            # Ключевые слова успеха
-            success_keywords = [
-                'привет', 'добро пожаловать', 'успешно', 
-                'активирован', 'готов', 'выберите', 'меню',
-                'баланс', 'кошелек', 'открыт', 'доступен',
-                'создан', 'запущен', 'работает', 'выберите валюту',
-                'добрый день', 'здравствуйте'
-            ]
-            
-            # Ключевые слова ошибки
-            error_keywords = [
-                'ошибка', 'не найден', 'не существует', 
-                'недействительный', 'invalid', 'error',
-                'неверный', 'истек', 'закончился',
-                'не удалось', 'попробуйте позже', 'not found'
-            ]
-            
-            if any(keyword in text_lower for keyword in error_keywords):
-                return False, f"❌ Ошибка: {response[:100]}..."
-            elif any(keyword in text_lower for keyword in success_keywords):
-                return True, f"✅ Успешно! {response[:100]}..."
-        
-        # Если не нашли ни успех, ни ошибку - считаем успехом
-        return True, f"✅ Активирована (ответ): {responses[0][:100]}..."
-        
-    except Exception as e:
-        logger.error(f"Ошибка активации: {e}")
-        return False, f"❌ Ошибка: {str(e)}"
-
-# ===== ПРОВЕРКА ЧЕРЕЗ @send =====
-async def check_with_send(link):
-    """Проверяет ссылку через @send"""
-    try:
-        logger.info(f"🔍 Проверяю через @send: {link}")
-        
-        # Отправляем ПОЛНУЮ ссылку в @send
-        success, error = await safe_send_message(user_client, SEND_BOT_USERNAME, link)
-        
-        if not success:
-            return False, f"❌ Ошибка отправки: {error}"
-        
-        await asyncio.sleep(CHECK_DELAY)
-        
-        async for msg in user_client.iter_messages(SEND_BOT_USERNAME, limit=3):
-            if msg.text and msg.text != link and len(msg.text) > 5:
-                text_lower = msg.text.lower()
-                
-                error_keywords = ['error', 'invalid', 'не найден', 'не существует', 'ошибка']
-                if any(keyword in text_lower for keyword in error_keywords):
-                    return False, f"@send: {msg.text[:100]}..."
-                else:
-                    return True, f"@send: {msg.text[:100]}..."
-        
-        return False, "❌ Нет ответа от @send"
-        
-    except Exception as e:
-        logger.error(f"Ошибка проверки: {e}")
-        return False, f"❌ Ошибка: {str(e)}"
-
-# ===== ПОЛНЫЙ ЦИКЛ =====
-async def check_and_activate_link(link):
-    """Полный цикл: проверка через @send + активация"""
-    if not is_authorized or not user_client:
-        return False, "❌ Не авторизован"
-    
-    if link in processed_links:
-        return False, "⚠️ Уже обработана"
-    
-    processed_links.add(link)
-    
-    try:
-        # ШАГ 1: Проверяем через @send (отправляем полную ссылку)
-        send_ok, send_msg = await check_with_send(link)
-        
-        if not send_ok:
-            logger.info(f"❌ @send отклонил: {link}")
-            return False, send_msg
-        
-        logger.info(f"✅ @send подтвердил: {link}")
-        
-        # ШАГ 2: Активируем (отправляем /start CQ...)
-        logger.info(f"🎯 Активирую: {link}")
-        activate_ok, activate_msg = await activate_link(link)
-        
-        if activate_ok:
-            activated_links.append({
-                'link': link,
-                'result': activate_msg,
-                'time': datetime.now().strftime('%H:%M:%S'),
-                'attempt': checked_count
-            })
-            return True, activate_msg
+    for item in dates:
+        if isinstance(item, datetime):
+            result.append(item.strftime("%d.%m.%Y"))
         else:
-            return False, f"❌ @send OK, но активация не удалась: {activate_msg}"
-            
-    except Exception as e:
-        logger.error(f"❌ Ошибка: {e}")
-        return False, f"❌ Ошибка: {str(e)}"
+            result.append(item)
 
-# ===== ПОИСКОВЫЙ РАБОЧИЙ ПРОЦЕСС =====
-async def search_worker():
-    """Основной рабочий процесс поиска и активации"""
-    global is_searching, checked_count, start_time, total_activated, error_count, flood_wait_active
-    
-    if not is_authorized:
-        logger.error("❌ Не авторизован для поиска")
-        return
-    
-    checked_count = 0
-    start_time = time.time()
-    
-    logger.info(f"🚀 Поиск и активация запущены!")
-    logger.info(f"⚡ Потоков: {MAX_CONCURRENT_CHECKS}")
-    logger.info(f"📦 Пакет: {BATCH_SIZE} ссылок")
-    logger.info(f"⏱ Задержка: {CHECK_DELAY} сек")
-    logger.info(f"📝 Формат: /start CQ...")
-    logger.info(f"🛡️ Flood защита включена")
-    
-    while is_searching:
-        try:
-            if flood_wait_active:
-                logger.info("⏳ Ожидание окончания flood wait...")
-                await asyncio.sleep(10)
-                continue
-            
-            # Генерируем ссылки
-            batch = []
-            for _ in range(BATCH_SIZE):
-                link = generate_cryptobot_link()
-                while link in processed_links:
-                    link = generate_cryptobot_link()
-                batch.append(link)
-            
-            logger.info(f"📦 Обрабатываю {len(batch)} ссылок...")
-            
-            # Обрабатываем по одной
-            for link in batch:
-                if not is_searching:
-                    break
-                
-                checked_count += 1
-                result = await check_and_activate_link(link)
-                
-                if isinstance(result, tuple) and result[0]:
-                    is_valid, msg = result
-                    if is_valid:
-                        total_activated += 1
-                        start_param = extract_start_param(link)
-                        logger.info(f"🎯 АКТИВИРОВАНА #{total_activated}!")
-                        logger.info(f"📝 Команда: /start {start_param}")
-                        
-                        try:
-                            await user_client.send_message(
-                                'me',
-                                f"🎯 **АКТИВИРОВАНА ССЫЛКА #{total_activated}!**\n\n"
-                                f"🔗 `{link}`\n"
-                                f"📝 Отправлено: `/start {start_param}`\n\n"
-                                f"📊 {msg}\n"
-                                f"🔢 Попыток: {checked_count}"
-                            )
-                        except Exception as e:
-                            logger.error(f"Ошибка уведомления: {e}")
-                
-                # Ждем перед следующей ссылкой
-                await asyncio.sleep(CHECK_DELAY)
-            
-            # Статистика
-            speed = get_speed()
-            logger.info(
-                f"📊 Статус: {checked_count} проверок | "
-                f"✅ Активировано: {total_activated} | "
-                f"{speed:.2f} ссылок/сек"
+    return "\n".join(result)
+
+
+# ============================================================
+# РАЗДЕЛЕНИЕ ПОСТОВ
+# ============================================================
+
+POST_SEPARATOR_PATTERN = re.compile(
+    r"""
+    (?mx)
+    ^[ \t]*
+    -/
+    [ \t]*
+    \(?
+    [ \t]*
+    [«»"'“”‘’]*
+    [ \t]*
+    \d+
+    [ \t]*
+    [«»"'“”‘’]*
+    [ \t]*
+    \)?
+    [ \t]*
+    (?:\r?\n|$)
+    """
+)
+
+
+def split_posts(text: str) -> list[str]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    if not normalized:
+        return []
+
+    matches = list(POST_SEPARATOR_PATTERN.finditer(normalized))
+
+    if not matches:
+        return [normalized]
+
+    posts: list[str] = []
+
+    prefix = normalized[:matches[0].start()].strip()
+    if prefix:
+        posts.append(prefix)
+
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = (
+            matches[index + 1].start()
+            if index + 1 < len(matches)
+            else len(normalized)
+        )
+
+        post = normalized[start:end].strip()
+
+        if post:
+            posts.append(post)
+
+    return posts
+
+
+# ============================================================
+# КАНАЛЫ
+# ============================================================
+
+async def can_edit_channel(
+    client: TelegramClient,
+    entity: types.Channel,
+) -> bool:
+    if getattr(entity, "creator", False):
+        return True
+
+    admin_rights = getattr(entity, "admin_rights", None)
+
+    if admin_rights is None:
+        return False
+
+    return bool(
+        getattr(admin_rights, "edit_messages", False)
+        or getattr(admin_rights, "post_messages", False)
+    )
+
+
+async def get_editable_channels() -> list[dict[str, Any]]:
+    client = await get_telethon_client()
+
+    if not await client.is_user_authorized():
+        raise RuntimeError("Аккаунт Telethon не авторизован")
+
+    channels: list[dict[str, Any]] = []
+
+    async for dialog in client.iter_dialogs():
+        entity = dialog.entity
+
+        if not isinstance(entity, types.Channel):
+            continue
+
+        if not getattr(entity, "broadcast", False):
+            continue
+
+        if not await can_edit_channel(client, entity):
+            continue
+
+        channels.append(
+            {
+                "id": entity.id,
+                "title": dialog.name or "Без названия",
+                "username": getattr(entity, "username", None),
+            }
+        )
+
+    channels.sort(key=lambda item: item["title"].casefold())
+    return channels
+
+
+def channels_keyboard(
+    channels: list[dict[str, Any]],
+    page: int,
+) -> InlineKeyboardMarkup:
+    total_pages = max(
+        1,
+        (len(channels) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE,
+    )
+
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * CHANNELS_PER_PAGE
+    end = start + CHANNELS_PER_PAGE
+    page_channels = channels[start:end]
+
+    builder = InlineKeyboardBuilder()
+
+    for channel in page_channels:
+        title = channel["title"]
+        if len(title) > 40:
+            title = title[:37] + "..."
+
+        builder.button(
+            text=f"📢 {title}",
+            callback_data=f"channel:{channel['id']}",
+        )
+
+    builder.adjust(1)
+
+    navigation: list[InlineKeyboardButton] = []
+
+    if page > 0:
+        navigation.append(
+            InlineKeyboardButton(
+                text="⬅️",
+                callback_data=f"channels_page:{page - 1}",
             )
-            
-            await asyncio.sleep(BETWEEN_BATCHES)
-            
-        except Exception as e:
-            error_count += 1
-            logger.error(f"❌ Ошибка: {e}")
-            await asyncio.sleep(5)
-
-# ===== КОМАНДЫ =====
-@bot_client.on(events.NewMessage(pattern='/setphone'))
-async def set_phone(event):
-    parts = event.message.text.split()
-    if len(parts) < 2:
-        await event.reply("📱 Введите номер: `/setphone +71234567890`")
-        return
-    
-    phone = parts[1].strip()
-    
-    if not phone.startswith('+') or not phone[1:].isdigit():
-        await event.reply("❌ Неверный формат")
-        return
-    
-    status_msg = await event.reply(f"📱 Подключаюсь к {phone}...")
-    result, message = await start_auth(phone)
-    
-    if result:
-        await status_msg.edit(f"✅ {message}")
-    else:
-        await status_msg.edit(f"📱 {message}\n\n💡 Введите код: `/setcode 12345`")
-
-@bot_client.on(events.NewMessage(pattern='/setcode'))
-async def set_code(event):
-    if not user_phone:
-        await event.reply("❌ Сначала введите номер")
-        return
-    
-    parts = event.message.text.split()
-    if len(parts) < 2:
-        await event.reply("📱 Введите код: `/setcode 12345`")
-        return
-    
-    code = parts[1].strip()
-    
-    if not code.isdigit():
-        await event.reply("❌ Только цифры")
-        return
-    
-    status_msg = await event.reply("🔐 Проверяю код...")
-    result, message = await complete_auth(code)
-    
-    if result:
-        await status_msg.edit(f"✅ {message}")
-        await status_msg.reply(
-            "🚀 **Авторизован!**\n\n"
-            "📌 /search - Запустить поиск\n"
-            "📌 /status - Статистика\n"
-            "📌 /found - Активированные ссылки"
         )
-    else:
-        if "пароль" in message.lower():
-            await status_msg.edit(f"🔑 {message}\n\n💡 `/setpassword ваш_пароль`")
-        else:
-            await status_msg.edit(f"❌ {message}")
 
-@bot_client.on(events.NewMessage(pattern='/setpassword'))
-async def set_password(event):
-    parts = event.message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        await event.reply("🔑 Введите пароль: `/setpassword ваш_пароль`")
-        return
-    
-    password = parts[1].strip()
-    status_msg = await event.reply("🔐 Проверяю пароль...")
-    result, message = await complete_auth_with_password(password)
-    
-    if result:
-        await status_msg.edit(f"✅ {message}")
-        await status_msg.reply("🚀 Авторизован! Используйте /search")
-    else:
-        await status_msg.edit(f"❌ {message}")
-
-@bot_client.on(events.NewMessage(pattern='/search'))
-async def start_search(event):
-    global is_searching, search_task
-    
-    if not is_authorized:
-        await event.reply("❌ Сначала авторизуйтесь")
-        return
-    
-    if is_searching:
-        await event.reply("⚠️ Поиск уже запущен")
-        return
-    
-    is_searching = True
-    search_task = asyncio.create_task(search_worker())
-    
-    await event.reply(
-        f"🚀 **Поиск запущен!**\n\n"
-        f"📝 Формат отправки: `/start CQ...`\n"
-        f"⏱ Задержка: {CHECK_DELAY} сек\n"
-        f"📦 Пакет: {BATCH_SIZE} ссылок\n"
-        f"🛡️ Flood защита активна\n\n"
-        f"📌 /stop - Остановить"
+    navigation.append(
+        InlineKeyboardButton(
+            text=f"{page + 1}/{total_pages}",
+            callback_data="channels_page:noop",
+        )
     )
 
-@bot_client.on(events.NewMessage(pattern='/stop'))
-async def stop_search(event):
-    global is_searching, search_task
-    
-    if not is_searching:
-        await event.reply("⚠️ Поиск не запущен")
-        return
-    
-    is_searching = False
-    
-    if search_task:
-        search_task.cancel()
+    if page < total_pages - 1:
+        navigation.append(
+            InlineKeyboardButton(
+                text="➡️",
+                callback_data=f"channels_page:{page + 1}",
+            )
+        )
+
+    builder.row(*navigation)
+
+    builder.row(
+        InlineKeyboardButton(
+            text="❌ Отмена",
+            callback_data="replace:cancel",
+        )
+    )
+
+    return builder.as_markup()
+
+
+# ============================================================
+# ПОЛУЧЕНИЕ СООБЩЕНИЙ
+# ============================================================
+
+async def resolve_channel(channel_id: int) -> types.Channel:
+    client = await get_telethon_client()
+
+    entity = await client.get_entity(
+        types.PeerChannel(channel_id)
+    )
+
+    if not isinstance(entity, types.Channel):
+        raise RuntimeError("Выбранный объект не является каналом")
+
+    return entity
+
+
+async def get_messages_for_dates(
+    channel_id: int,
+    dates: list[str],
+) -> list[types.Message]:
+    """
+    Возвращает существующие сообщения канала за выбранные даты.
+    Даты сравниваются в часовом поясе Europe/Moscow.
+    Новые сообщения эта функция не создаёт.
+    """
+    client = await get_telethon_client()
+    channel = await resolve_channel(channel_id)
+
+    target_dates = {
+        datetime.strptime(value, "%d.%m.%Y").date()
+        for value in dates
+    }
+
+    first_date = min(target_dates)
+    last_date = max(target_dates)
+
+    # Верхняя граница поиска: начало следующего дня по Москве,
+    # преобразованное в UTC для Telethon.
+    local_end = datetime.combine(
+        last_date + timedelta(days=1),
+        datetime.min.time(),
+        tzinfo=CHANNEL_TIMEZONE,
+    )
+    offset_date = local_end.astimezone(timezone.utc)
+
+    found: list[types.Message] = []
+
+    async for message in client.iter_messages(
+        channel,
+        offset_date=offset_date,
+    ):
+        if message.date is None:
+            continue
+
+        local_message_date = message.date.astimezone(
+            CHANNEL_TIMEZONE
+        ).date()
+
+        if local_message_date < first_date:
+            break
+
+        if local_message_date not in target_dates:
+            continue
+
+        if getattr(message, "action", None) is not None:
+            continue
+
+        # Берём только реальные публикации. У медиапоста будет
+        # заменена подпись, само медиа останется прежним.
+        if message.message is None and message.media is None:
+            continue
+
+        found.append(message)
+
+    found.sort(
+        key=lambda item: (
+            item.date,
+            item.id,
+        )
+    )
+
+    return found
+
+
+# ============================================================
+# РЕДАКТИРОВАНИЕ
+# ============================================================
+
+async def edit_channel_message(
+    channel: types.Channel,
+    old_message: types.Message,
+    new_text: str,
+) -> None:
+    client = await get_telethon_client()
+
+    await client.edit_message(
+        entity=channel,
+        message=old_message.id,
+        text=new_text,
+        parse_mode=None,
+        link_preview=False,
+    )
+
+
+async def perform_replacement(
+    channel_id: int,
+    dates: list[str],
+    new_posts: list[str],
+) -> tuple[int, list[str]]:
+    """
+    Только редактирует уже существующие публикации канала.
+    Отправка новых сообщений в канал отсутствует.
+    """
+    channel = await resolve_channel(channel_id)
+    old_messages = await get_messages_for_dates(channel_id, dates)
+
+    if len(old_messages) < len(new_posts):
+        raise RuntimeError(
+            f"Найдено только {len(old_messages)} сообщений, "
+            f"а новых текстов передано {len(new_posts)}."
+        )
+
+    selected_messages = old_messages[:len(new_posts)]
+    edited_count = 0
+    errors_list: list[str] = []
+
+    for index, (old_message, new_text) in enumerate(
+        zip(selected_messages, new_posts),
+        start=1,
+    ):
         try:
-            await search_task
-        except:
+            await edit_channel_message(
+                channel=channel,
+                old_message=old_message,
+                new_text=new_text,
+            )
+            edited_count += 1
+
+        except errors.FloodWaitError as error:
+            await asyncio.sleep(int(error.seconds) + 1)
+
+            try:
+                await edit_channel_message(
+                    channel=channel,
+                    old_message=old_message,
+                    new_text=new_text,
+                )
+                edited_count += 1
+            except Exception as retry_error:
+                logger.exception(
+                    "Ошибка повторного редактирования сообщения %s",
+                    old_message.id,
+                )
+                errors_list.append(
+                    f"Пост {index}, ID {old_message.id}: "
+                    f"{type(retry_error).__name__}: {retry_error}"
+                )
+
+        except errors.MessageNotModifiedError:
+            # Текст уже совпадает с новым.
+            edited_count += 1
+
+        except errors.MessageEditTimeExpiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "истёк допустимый срок редактирования"
+            )
+
+        except errors.ChatAdminRequiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "недостаточно прав администратора"
+            )
+
+        except errors.MessageAuthorRequiredError:
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                "аккаунт не может редактировать этот пост"
+            )
+
+        except Exception as error:
+            logger.exception(
+                "Ошибка редактирования сообщения %s",
+                old_message.id,
+            )
+            errors_list.append(
+                f"Пост {index}, ID {old_message.id}: "
+                f"{type(error).__name__}: {error}"
+            )
+
+        # Небольшая пауза снижает вероятность FloodWait.
+        await asyncio.sleep(0.7)
+
+    return edited_count, errors_list
+
+
+def post_preview(text: str, max_length: int = 170) -> str:
+    one_line = " ".join(text.split())
+
+    if len(one_line) > max_length:
+        one_line = one_line[:max_length - 3] + "..."
+
+    return html.escape(one_line)
+
+
+# ============================================================
+# КОМАНДЫ
+# ============================================================
+
+@router.message(CommandStart())
+async def command_start(message: Message, state: FSMContext) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "👋 <b>Редактор постов канала</b>\n\n"
+        "Авторизуйте аккаунт через Telethon, выберите канал, "
+        "укажите даты и отправьте новые посты.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(Command("cancel"))
+@router.message(F.text == "❌ Отмена")
+async def cancel_handler(message: Message, state: FSMContext) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.clear()
+
+    await message.answer(
+        "❌ Действие отменено.",
+        reply_markup=main_keyboard(),
+    )
+
+
+@router.message(F.text == "👤 Статус аккаунта")
+async def account_status(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    try:
+        client = await get_telethon_client()
+
+        if not await client.is_user_authorized():
+            await message.answer(
+                "❌ Пользовательский аккаунт не авторизован.",
+                reply_markup=main_keyboard(),
+            )
+            return
+
+        me = await client.get_me()
+
+        username = f"@{me.username}" if me.username else "не установлен"
+        phone = f"+{me.phone}" if me.phone else "скрыт"
+
+        await message.answer(
+            "✅ <b>Аккаунт авторизован</b>\n\n"
+            f"Имя: <b>{html.escape(me.first_name or '')}</b>\n"
+            f"Username: <b>{html.escape(username)}</b>\n"
+            f"Телефон: <code>{html.escape(phone)}</code>\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка получения статуса аккаунта")
+        await message.answer(
+            f"❌ Ошибка проверки аккаунта:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+# ============================================================
+# АВТОРИЗАЦИЯ
+# ============================================================
+
+@router.message(F.text == "🔐 Авторизация")
+async def authorization_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    client = await get_telethon_client()
+
+    if await client.is_user_authorized():
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ Аккаунт уже авторизован.\n\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await state.clear()
+    await state.set_state(AuthorizationStates.waiting_phone)
+
+    await message.answer(
+        "📱 Отправьте номер телефона аккаунта.\n\n"
+        "Формат: <code>+79991234567</code>",
+        reply_markup=phone_keyboard(),
+    )
+
+
+@router.message(AuthorizationStates.waiting_phone)
+async def authorization_phone(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    phone: str | None = None
+
+    if message.contact:
+        if message.contact.user_id != message.from_user.id:
+            await message.answer("❌ Отправьте собственный контакт.")
+            return
+
+        phone = message.contact.phone_number
+    elif message.text:
+        phone = message.text.strip()
+
+    if not phone:
+        await message.answer("❌ Не удалось получить номер телефона.")
+        return
+
+    phone = re.sub(r"[^\d+]", "", phone)
+
+    if not phone.startswith("+"):
+        phone = "+" + phone
+
+    if not re.fullmatch(r"\+\d{7,15}", phone):
+        await message.answer(
+            "❌ Неверный формат.\n"
+            "Пример: <code>+79991234567</code>"
+        )
+        return
+
+    try:
+        client = await recreate_telethon_client()
+        sent_code = await client.send_code_request(phone)
+
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent_code.phone_code_hash,
+        )
+        await state.set_state(AuthorizationStates.waiting_code)
+
+        await message.answer(
+            "✉️ Telegram отправил код входа.\n\n"
+            "Отправьте код цифрами.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+    except errors.PhoneNumberInvalidError:
+        await message.answer("❌ Telegram считает номер некорректным.")
+
+    except errors.PhoneNumberBannedError:
+        await message.answer("❌ Этот номер заблокирован Telegram.")
+
+    except errors.FloodWaitError as error:
+        await message.answer(
+            f"⏳ Слишком много попыток. Повторите через "
+            f"<b>{error.seconds} сек.</b>"
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка отправки кода")
+        await message.answer(
+            "❌ Не удалось отправить код:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(AuthorizationStates.waiting_code)
+async def authorization_code(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    if not message.text:
+        await message.answer("❌ Отправьте код текстом.")
+        return
+
+    code = re.sub(r"\D", "", message.text)
+
+    if not code:
+        await message.answer("❌ Код должен содержать цифры.")
+        return
+
+    data = await state.get_data()
+    phone = data.get("phone")
+    phone_code_hash = data.get("phone_code_hash")
+
+    if not phone or not phone_code_hash:
+        await state.clear()
+        await message.answer(
+            "❌ Данные авторизации потеряны. Начните заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    try:
+        client = await get_telethon_client()
+
+        await client.sign_in(
+            phone=phone,
+            code=code,
+            phone_code_hash=phone_code_hash,
+        )
+
+        await save_current_telethon_session(client)
+        await state.clear()
+
+        me = await client.get_me()
+
+        await message.answer(
+            "✅ <b>Авторизация выполнена</b>\n\n"
+            f"Аккаунт: <b>{html.escape(me.first_name or '')}</b>\n"
+            f"ID: <code>{me.id}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+    except errors.SessionPasswordNeededError:
+        await state.set_state(AuthorizationStates.waiting_password)
+
+        await message.answer(
+            "🔐 На аккаунте включён облачный пароль.\n\n"
+            "Отправьте пароль двухэтапной аутентификации."
+        )
+
+    except errors.PhoneCodeInvalidError:
+        await message.answer("❌ Неверный код. Попробуйте ещё раз.")
+
+    except errors.PhoneCodeExpiredError:
+        await state.clear()
+        await message.answer(
+            "❌ Код истёк. Начните авторизацию заново.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка входа по коду")
+        await message.answer(
+            "❌ Ошибка авторизации:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(AuthorizationStates.waiting_password)
+async def authorization_password(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    if not message.text:
+        await message.answer("❌ Отправьте пароль текстом.")
+        return
+
+    try:
+        client = await get_telethon_client()
+        await client.sign_in(password=message.text)
+
+        await save_current_telethon_session(client)
+        await state.clear()
+
+        me = await client.get_me()
+
+        try:
+            await message.delete()
+        except TelegramBadRequest:
             pass
-        search_task = None
-    
-    elapsed = get_elapsed()
-    speed = get_speed()
-    
-    await event.reply(
-        f"⏹ **Поиск остановлен!**\n\n"
-        f"🔍 Проверено: {checked_count}\n"
-        f"✅ Активировано: {total_activated}\n"
-        f"⏱ Время: {elapsed:.1f} сек\n"
-        f"🚀 Скорость: {speed:.2f} ссылок/сек"
-    )
 
-@bot_client.on(events.NewMessage(pattern='/status'))
-async def show_status(event):
-    if not is_searching:
-        await event.reply("⚠️ Поиск не запущен")
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                "✅ <b>Авторизация выполнена</b>\n\n"
+                f"Аккаунт: <b>{html.escape(me.first_name or '')}</b>\n"
+                f"ID: <code>{me.id}</code>"
+            ),
+            reply_markup=main_keyboard(),
+        )
+
+    except errors.PasswordHashInvalidError:
+        await message.answer("❌ Неверный облачный пароль.")
+
+    except Exception as error:
+        logger.exception("Ошибка входа по паролю")
+        await message.answer(
+            "❌ Ошибка авторизации:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.message(F.text == "🚪 Выйти из аккаунта")
+async def logout_handler(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    global telethon_client
+
+    if await reject_non_admin_message(message):
         return
-    
-    elapsed = get_elapsed()
-    speed = get_speed()
-    
-    await event.reply(
-        f"📊 **Статистика:**\n\n"
-        f"🔄 Статус: {'🟢 Активен' if is_searching else '🔴 Остановлен'}\n"
-        f"🔍 Проверено: {checked_count}\n"
-        f"✅ Активировано: {total_activated}\n"
-        f"⚡ Скорость: {speed:.2f} ссылок/сек\n"
-        f"⏱ Время: {elapsed:.1f} сек\n"
-        f"🛡️ Flood защита: {'🟢 OK' if not flood_wait_active else '🔴 Ожидание'}"
-    )
 
-@bot_client.on(events.NewMessage(pattern='/found'))
-async def show_found_links(event):
-    if not activated_links:
-        await event.reply("❌ Нет активированных ссылок")
-        return
-    
-    last_links = activated_links[-10:]
-    text = f"✅ **Активировано: {len(activated_links)}**\n\n"
-    for i, item in enumerate(last_links, 1):
-        start_param = extract_start_param(item['link'])
-        text += f"#{i} `/start {start_param}`\n"
-        text += f"   ⏱ {item['time']}\n\n"
-    
-    await event.reply(text)
+    await state.clear()
 
-@bot_client.on(events.NewMessage(pattern='/clear'))
-async def clear_found(event):
-    global activated_links, total_activated, processed_links
-    count = len(activated_links)
-    activated_links = []
-    total_activated = 0
-    processed_links = set()
-    await event.reply(f"🧹 Очищено {count} ссылок")
-
-@bot_client.on(events.NewMessage(pattern='/generate'))
-async def generate_links(event):
-    parts = event.message.text.split()
-    count = min(int(parts[1]) if len(parts) > 1 else 10, 20)
-    
-    links = [generate_cryptobot_link() for _ in range(count)]
-    text = f"🔗 **{count} ссылок:**\n\n"
-    for i, link in enumerate(links, 1):
-        start_param = extract_start_param(link)
-        text += f"{i}. `/start {start_param}`\n"
-    
-    await event.reply(text)
-
-@bot_client.on(events.NewMessage(pattern='/start'))
-async def start_command(event):
-    await event.reply(
-        f"🚀 **Бот-активатор ссылок**\n\n"
-        f"📌 **Авторизация:**\n"
-        f"/setphone +71234567890 - Ввести номер\n"
-        f"/setcode 12345 - Ввести код\n"
-        f"/setpassword пароль - 2FA\n\n"
-        f"📌 **Команды:**\n"
-        f"/search - Запустить поиск\n"
-        f"/stop - Остановить\n"
-        f"/status - Статистика\n"
-        f"/found - Активированные\n"
-        f"/generate - Сгенерировать ссылки\n"
-        f"/clear - Очистить\n\n"
-        f"📝 **Формат:**\n"
-        f"Бот отправляет: `/start CQ...`\n"
-        f"⏱ Задержка: {CHECK_DELAY} сек"
-    )
-
-# ===== ЗАПУСК =====
-async def main():
     try:
-        await bot_client.start(bot_token=BOT_TOKEN)
-        
-        print("🚀 БОТ ЗАПУЩЕН!")
-        print("📝 Отправляет: /start CQ...")
-        print("⚙️ БЕЗОПАСНЫЙ РЕЖИМ (без flood)")
-        print(f"⏱ Задержка: {CHECK_DELAY} сек")
-        print("💡 /search - запустить поиск")
-        print("✅ Готов к работе!")
-        
-        await bot_client.run_until_disconnected()
-        
-    except Exception as e:
-        print(f"❌ Ошибка: {e}")
+        client = await get_telethon_client()
+
+        if await client.is_user_authorized():
+            await client.log_out()
+
+        telethon_client = None
+        delete_session_file()
+
+        await message.answer(
+            "✅ Сессия пользовательского аккаунта удалена.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка выхода из аккаунта")
+        await message.answer(
+            "❌ Ошибка выхода:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+# ============================================================
+# ВЫБОР КАНАЛА
+# ============================================================
+
+@router.message(F.text == "📝 Заменить посты")
+async def replacement_start(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    client = await get_telethon_client()
+
+    if not await client.is_user_authorized():
+        await message.answer(
+            "❌ Сначала авторизуйте пользовательский аккаунт.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    loading = await message.answer("🔍 Получаю список каналов...")
+
+    try:
+        channels = await get_editable_channels()
+
+        if not channels:
+            await loading.edit_text(
+                "❌ Не найдено каналов, в которых аккаунт может "
+                "редактировать посты."
+            )
+            return
+
+        await state.clear()
+        await state.update_data(channels=channels)
+        await state.set_state(ReplacementStates.choosing_channel)
+
+        await loading.edit_text(
+            "📢 <b>Выберите канал</b>",
+            reply_markup=channels_keyboard(channels, page=0),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка получения каналов")
+
+        await loading.edit_text(
+            "❌ Не удалось получить каналы:\n"
+            f"<code>{html.escape(str(error))}</code>"
+        )
+
+
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data.startswith("channels_page:"),
+)
+async def channels_page_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    value = callback.data.split(":", maxsplit=1)[1]
+
+    if value == "noop":
+        await callback.answer()
+        return
+
+    page = int(value)
+    data = await state.get_data()
+    channels = data.get("channels", [])
+
+    await callback.message.edit_reply_markup(
+        reply_markup=channels_keyboard(channels, page)
+    )
+    await callback.answer()
+
+
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data.startswith("channel:"),
+)
+async def channel_selected(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    channel_id = int(callback.data.split(":", maxsplit=1)[1])
+
+    data = await state.get_data()
+    channels: list[dict[str, Any]] = data.get("channels", [])
+
+    selected = next(
+        (
+            channel
+            for channel in channels
+            if channel["id"] == channel_id
+        ),
+        None,
+    )
+
+    if selected is None:
+        await callback.answer(
+            "Канал не найден. Начните заново.",
+            show_alert=True,
+        )
+        return
+
+    await state.update_data(
+        channel_id=channel_id,
+        channel_title=selected["title"],
+        channels=None,
+    )
+    await state.set_state(ReplacementStates.waiting_dates)
+
+    await callback.message.edit_text(
+        "✅ Выбран канал:\n"
+        f"<b>{html.escape(selected['title'])}</b>"
+    )
+
+    await callback.message.answer(
+        "📅 <b>Отправьте даты сообщений</b>\n\n"
+        "<code>03.03.2026\n"
+        "04.04.2026\n"
+        "15.05.2026</code>"
+    )
+
+    await callback.answer()
+
+
+# ============================================================
+# ДАТЫ И ПОСТЫ
+# ============================================================
+
+@router.message(ReplacementStates.waiting_dates)
+async def dates_received(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    if not message.text:
+        await message.answer("❌ Отправьте даты текстовым сообщением.")
+        return
+
+    try:
+        parsed_dates = parse_dates(message.text)
+    except ValueError as error:
+        await message.answer(
+            f"❌ {html.escape(str(error))}\n\n"
+            "Пример:\n"
+            "<code>03.03.2026\n04.04.2026</code>"
+        )
+        return
+
+    dates_strings = [
+        date.strftime("%d.%m.%Y")
+        for date in parsed_dates
+    ]
+
+    await state.update_data(
+        dates=dates_strings,
+        posts=[],
+    )
+    await state.set_state(ReplacementStates.collecting_posts)
+
+    await message.answer(
+        "✅ <b>Даты сохранены</b>\n\n"
+        f"<code>{html.escape(format_dates(dates_strings))}</code>\n\n"
+        "Теперь отправляйте новые посты.\n\n"
+        "Разделители:\n"
+        "<code>-/1\n-/2\n-/3</code>\n\n"
+        "или:\n"
+        "<code>-/(1)\n-/(2)</code>\n\n"
+        "Номера игнорируются, учитывается только порядок.\n"
+        f"Максимум: <b>{MAX_POSTS}</b>.",
+        reply_markup=collection_keyboard(),
+    )
+
+
+@router.message(
+    ReplacementStates.collecting_posts,
+    F.text == "🗑 Очистить посты",
+)
+async def clear_collected_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await state.update_data(posts=[])
+
+    await message.answer(
+        "🗑 Все принятые посты удалены."
+    )
+
+
+@router.message(
+    ReplacementStates.collecting_posts,
+    F.text == "✅ Готово",
+)
+async def finish_collecting_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    data = await state.get_data()
+
+    channel_id = data.get("channel_id")
+    channel_title = data.get("channel_title")
+    dates: list[str] = data.get("dates", [])
+    posts: list[str] = data.get("posts", [])
+
+    if not channel_id or not dates:
+        await state.clear()
+        await message.answer(
+            "❌ Данные операции потеряны. Начните заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    if not posts:
+        await message.answer(
+            "❌ Вы ещё не отправили ни одного поста."
+        )
+        return
+
+    try:
+        old_messages = await get_messages_for_dates(
+            channel_id=channel_id,
+            dates=dates,
+        )
+
+        if len(old_messages) < len(posts):
+            await message.answer(
+                "❌ <b>Недостаточно сообщений для замены</b>\n\n"
+                f"Новых текстов: <b>{len(posts)}</b>\n"
+                f"Найдено существующих постов: "
+                f"<b>{len(old_messages)}</b>\n\n"
+                "Новые сообщения в канал создаваться не будут.",
+                reply_markup=collection_keyboard(),
+            )
+            return
+
+        preview_lines: list[str] = []
+
+        for index, post in enumerate(posts[:5], start=1):
+            preview_lines.append(
+                f"<b>{index}.</b> {post_preview(post)}"
+            )
+
+        if len(posts) > 5:
+            preview_lines.append(
+                f"\n…и ещё <b>{len(posts) - 5}</b>"
+            )
+
+        await state.set_state(ReplacementStates.confirmation)
+
+        await message.answer(
+            "⚠️ <b>Подтвердите замену</b>\n\n"
+            f"Канал: <b>{html.escape(channel_title)}</b>\n"
+            f"Дат выбрано: <b>{len(dates)}</b>\n"
+            f"Найдено существующих постов: "
+            f"<b>{len(old_messages)}</b>\n"
+            f"Новых текстов: <b>{len(posts)}</b>\n\n"
+            + "\n\n".join(preview_lines)
+            + "\n\nБот только изменит существующие посты. "
+              "Ничего нового в канал отправлено не будет.",
+            reply_markup=confirmation_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Ошибка проверки сообщений")
+        await state.clear()
+
+        await message.answer(
+            "❌ Ошибка проверки канала:\n"
+            f"<code>{html.escape(str(error))}</code>",
+            reply_markup=main_keyboard(),
+        )
+
+
+@router.message(ReplacementStates.collecting_posts)
+async def collect_posts(
+    message: Message,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    incoming_text = message.text or message.caption
+
+    if not incoming_text:
+        await message.answer(
+            "❌ Поддерживаются текстовые сообщения и подписи к медиа."
+        )
+        return
+
+    new_parts = split_posts(incoming_text)
+
+    if not new_parts:
+        await message.answer(
+            "❌ В сообщении не найден текст поста."
+        )
+        return
+
+    data = await state.get_data()
+    current_posts: list[str] = data.get("posts", [])
+
+    available = MAX_POSTS - len(current_posts)
+
+    if available <= 0:
+        await message.answer(
+            f"❌ Уже принято максимальное количество: "
+            f"{MAX_POSTS} постов."
+        )
+        return
+
+    accepted_parts = new_parts[:available]
+    rejected_count = len(new_parts) - len(accepted_parts)
+
+    current_posts.extend(accepted_parts)
+    await state.update_data(posts=current_posts)
+
+    response = (
+        f"✅ Принято из сообщения: <b>{len(accepted_parts)}</b>\n"
+        f"Всего: <b>{len(current_posts)}/{MAX_POSTS}</b>"
+    )
+
+    if rejected_count:
+        response += (
+            f"\n⚠️ Не принято из-за лимита: "
+            f"<b>{rejected_count}</b>"
+        )
+
+    await message.answer(response)
+
+
+# ============================================================
+# ПОДТВЕРЖДЕНИЕ
+# ============================================================
+
+@router.callback_query(
+    ReplacementStates.confirmation,
+    F.data == "replace:cancel",
+)
+@router.callback_query(
+    ReplacementStates.choosing_channel,
+    F.data == "replace:cancel",
+)
+async def replacement_cancel_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    await state.clear()
+
+    await callback.message.answer(
+        "❌ Операция отменена.",
+        reply_markup=main_keyboard(),
+    )
+
+    await callback.answer()
+
+
+@router.callback_query(
+    ReplacementStates.confirmation,
+    F.data == "replace:confirm",
+)
+async def replacement_confirm_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+) -> None:
+    if await reject_non_admin_callback(callback):
+        return
+
+    data = await state.get_data()
+
+    channel_id = data.get("channel_id")
+    channel_title = data.get("channel_title")
+    dates: list[str] = data.get("dates", [])
+    posts: list[str] = data.get("posts", [])
+
+    if not channel_id or not dates or not posts:
+        await state.clear()
+        await callback.answer(
+            "Данные операции потеряны",
+            show_alert=True,
+        )
+        await callback.message.answer(
+            "❌ Начните операцию заново.",
+            reply_markup=main_keyboard(),
+        )
+        return
+
+    await state.set_state(ReplacementStates.processing)
+    await callback.answer("Замена началась")
+
+    try:
+        edited_count, errors_list = await perform_replacement(
+            channel_id=channel_id,
+            dates=dates,
+            new_posts=posts,
+        )
+
+        error_text = ""
+
+        if errors_list:
+            shown_errors = errors_list[:10]
+            error_text = (
+                "\n\n⚠️ <b>Ошибки:</b>\n"
+                + "\n".join(
+                    f"• {html.escape(value)}"
+                    for value in shown_errors
+                )
+            )
+
+            if len(errors_list) > 10:
+                error_text += (
+                    f"\n• …и ещё {len(errors_list) - 10}"
+                )
+
+        await callback.message.answer(
+            "✅ <b>Замена завершена</b>\n\n"
+            f"Канал: <b>{html.escape(channel_title)}</b>\n"
+            f"Изменено: <b>{edited_count}/{len(posts)}</b>\n"
+            f"Ошибок: <b>{len(errors_list)}</b>"
+            f"{error_text}\n\n"
+            "Новые сообщения в канал не отправлялись.",
+            reply_markup=main_keyboard(),
+        )
+
+    except Exception as error:
+        logger.exception("Критическая ошибка замены")
+
+        await callback.message.answer(
+            "❌ <b>Замена остановлена</b>\n\n"
+            f"<code>{html.escape(str(error))}</code>\n\n"
+            "Новые сообщения в канал не отправлялись.",
+            reply_markup=main_keyboard(),
+        )
+
     finally:
-        if bot_client:
-            await bot_client.disconnect()
-        if user_client:
-            await user_client.disconnect()
+        await state.clear()
 
-if __name__ == '__main__':
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+
+@router.message(ReplacementStates.processing)
+async def processing_message_handler(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await message.answer(
+        "⏳ Сейчас выполняется замена сообщений."
+    )
+
+
+@router.message(StateFilter(None))
+async def unknown_message(message: Message) -> None:
+    if await reject_non_admin_message(message):
+        return
+
+    await message.answer(
+        "Выберите действие в меню.",
+        reply_markup=main_keyboard(),
+    )
+
+
+async def on_shutdown() -> None:
+    global telethon_client
+
+    if telethon_client is not None:
+        try:
+            await telethon_client.disconnect()
+        except Exception:
+            logger.exception("Ошибка отключения Telethon")
+
+
+async def main() -> None:
+    logger.info("Запуск бота")
+
+    await bot.delete_webhook(drop_pending_updates=True)
+
     try:
-        loop.run_until_complete(main())
+        await dp.start_polling(bot)
+    finally:
+        await on_shutdown()
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n👋 Бот остановлен")
-    finally:
-        loop.close()
+        logger.info("Бот остановлен")
