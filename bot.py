@@ -38,7 +38,7 @@ API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
 BOT_TOKEN = "8961878352:AAGcRX9m6VHWTjdzf9R0NZmfi5f8uCIMVGQ"
 
 # Укажите свой Telegram ID
-ADMIN_ID = 123456789
+ADMIN_ID = 8489562559
 
 BASE_DIR = Path(__file__).resolve().parent
 SESSION_FILE = BASE_DIR / "telethon_session.txt"
