@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import csv
 import os
+import tempfile
 from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import datetime
@@ -39,11 +40,18 @@ PREVIEW_LIMIT = 12
 
 
 @dataclass(frozen=True)
+class AlbumInfo:
+    message_ids: tuple[int, ...]
+    caption_text: str
+    caption_entities: tuple[object, ...]
+
+
+@dataclass(frozen=True)
 class Pair:
     source: Message
     target: Message
     difference_seconds: float
-    omitted_album_message_ids: tuple[int, ...] = ()
+    album: AlbumInfo | None = None
 
 
 def load_saved_owner() -> int | None:
@@ -78,10 +86,10 @@ async def load_posts(
     entity: object,
     *,
     allow_albums_without_media: bool = False,
-) -> tuple[list[Message], dict[str, int], dict[int, tuple[int, ...]]]:
+) -> tuple[list[Message], dict[str, int], dict[int, AlbumInfo]]:
     posts: list[Message] = []
     album_messages: dict[int, list[Message]] = {}
-    albums_without_media: dict[int, tuple[int, ...]] = {}
+    albums: dict[int, AlbumInfo] = {}
     skipped = {
         "album_groups": 0,
         "album_items": 0,
@@ -110,23 +118,35 @@ async def load_posts(
         for items in album_messages.values():
             ordered = sorted(items, key=lambda item: (item.date, item.id))
             captioned = [item for item in ordered if item.raw_text]
-            representative = captioned[0] if captioned else ordered[0]
+            caption_message = captioned[0] if captioned else None
+            photos = [
+                item
+                for item in ordered
+                if isinstance(item.media, types.MessageMediaPhoto)
+            ]
+            # Для альбома берём именно первое фото. Если фото нет, берём первый
+            # медиаэлемент (например, видео), чтобы не терять весь пост.
+            representative = photos[0] if photos else ordered[0]
             posts.append(representative)
-            albums_without_media[representative.id] = tuple(
-                item.id for item in ordered
+            albums[representative.id] = AlbumInfo(
+                message_ids=tuple(item.id for item in ordered),
+                caption_text=(caption_message.raw_text if caption_message else ""),
+                caption_entities=tuple(
+                    caption_message.entities or [] if caption_message else []
+                ),
             )
 
     posts.sort(key=lambda item: (item.date, item.id))
-    return posts, skipped, albums_without_media
+    return posts, skipped, albums
 
 
 def build_pairs(
     source_posts: Sequence[Message],
     target_posts: Sequence[Message],
-    source_albums_without_media: dict[int, tuple[int, ...]] | None = None,
+    source_albums: dict[int, AlbumInfo] | None = None,
 ) -> list[Pair]:
     """Для каждого source выбирает ближайший ещё не использованный target."""
-    album_map = source_albums_without_media or {}
+    album_map = source_albums or {}
     available = sorted(
         ((post.date.timestamp(), post.id, post) for post in target_posts),
         key=lambda item: (item[0], item[1]),
@@ -166,7 +186,7 @@ def build_pairs(
                 source=source,
                 target=target,
                 difference_seconds=abs(target_timestamp - source_timestamp),
-                omitted_album_message_ids=album_map.get(source.id, ()),
+                album=album_map.get(source.id),
             )
         )
 
@@ -239,11 +259,9 @@ async def edit_with_flood_wait(
 ) -> str:
     source = pair.source
     target = pair.target
-    omit_album_media = bool(pair.omitted_album_message_ids)
-    source_media = None if omit_album_media else transferable_media(source)
-    source_has_web_preview = (
-        not omit_album_media
-        and isinstance(source.media, types.MessageMediaWebPage)
+    source_media = transferable_media(source)
+    source_has_web_preview = pair.album is None and isinstance(
+        source.media, types.MessageMediaWebPage
     )
     target_has_attached_media = target.media is not None and not isinstance(
         target.media, types.MessageMediaWebPage
@@ -256,25 +274,95 @@ async def edit_with_flood_wait(
     else:
         file_to_set = None
 
-    text_to_set = source.raw_text or (
-        "Фото не перенесены" if omit_album_media else ""
+    text_to_set = (
+        pair.album.caption_text if pair.album is not None else source.raw_text or ""
+    )
+    entities_to_set = (
+        list(pair.album.caption_entities)
+        if pair.album is not None
+        else source.entities or []
     )
 
-    while True:
+    async def perform_edit(
+        file_value: object | None,
+        text_value: str,
+        formatting_entities: Sequence[object],
+    ) -> None:
+        while True:
+            try:
+                await client.edit_message(
+                    target_entity,
+                    target.id,
+                    text_value,
+                    formatting_entities=list(formatting_entities),
+                    link_preview=source_has_web_preview,
+                    file=file_value,
+                )
+                return
+            except errors.FloodWaitError as exc:
+                await asyncio.sleep(int(exc.seconds) + 1)
+
+    try:
+        await perform_edit(file_to_set, text_to_set, entities_to_set)
+        return "changed"
+    except errors.MessageNotModifiedError:
+        return "already_equal"
+    except errors.RPCError as direct_error:
+        # Некоторые фото Telegram не даёт переиспользовать напрямую. Тогда
+        # скачиваем оригинал и загружаем его заново, чтобы сохранить пост.
+        if (
+            source_media is not None
+            and type(direct_error).__name__ != "MediaCaptionTooLongError"
+        ):
+            try:
+                with tempfile.TemporaryDirectory(prefix="tg_post_") as directory:
+                    downloaded = await client.download_media(source, file=directory)
+                    if downloaded:
+                        await perform_edit(downloaded, text_to_set, entities_to_set)
+                        return "changed_reuploaded"
+            except errors.MessageNotModifiedError:
+                return "already_equal"
+            except (errors.RPCError, OSError):
+                pass
+
+        # Если тип медиа вообще нельзя поставить редактированием или подпись
+        # слишком длинная, сохраняем полный текст поста без нового медиа.
+        fallback_text = text_to_set or "Медиа не перенесено"
+        remove_target_media = (
+            types.InputMediaEmpty() if target_has_attached_media else None
+        )
         try:
-            await client.edit_message(
-                target_entity,
-                target.id,
-                text_to_set,
-                formatting_entities=source.entities or [],
-                link_preview=source_has_web_preview,
-                file=file_to_set,
+            await perform_edit(
+                remove_target_media,
+                fallback_text,
+                entities_to_set if text_to_set else [],
             )
-            return "changed"
+            return "changed_text_only"
         except errors.MessageNotModifiedError:
             return "already_equal"
-        except errors.FloodWaitError as exc:
-            await asyncio.sleep(int(exc.seconds) + 1)
+        except errors.RPCError:
+            # Повреждённые или неподдерживаемые entities не должны мешать
+            # переносу самого текста.
+            try:
+                await perform_edit(remove_target_media, fallback_text, [])
+                return "changed_text_only_plain"
+            except errors.MessageNotModifiedError:
+                return "already_equal"
+            except errors.RPCError:
+                if not target_has_attached_media:
+                    raise direct_error
+
+        # Telegram не всегда разрешает удалить старое медиа из существующего
+        # поста. Тогда оставляем его и меняем подпись; она ограничена 1024
+        # символами, поэтому форматирование в этом аварийном режиме очищается.
+        safe_caption = fallback_text[:1024]
+        try:
+            await perform_edit(None, safe_caption, [])
+            return "changed_caption_only"
+        except errors.MessageNotModifiedError:
+            return "already_equal"
+        except errors.RPCError:
+            raise direct_error
 
 
 def write_log(rows: Sequence[dict[str, object]]) -> Path:
@@ -285,9 +373,10 @@ def write_log(rows: Sequence[dict[str, object]]) -> Path:
         "target_id",
         "target_date",
         "difference_seconds",
-        "media_omitted",
+        "album_first_media_only",
         "source_album_message_ids",
         "status",
+        "fallback",
         "error",
     ]
     with path.open("w", encoding="utf-8-sig", newline="") as file:
@@ -470,7 +559,7 @@ async def main() -> None:
             f"Канал 2: {channel_title(target, 80)} — {len(target_posts)} постов",
             f"Будет обработано: {len(pairs)} пар",
             (
-                "Альбомов Канала 1 будет перенесено без фото: "
+                "Альбомов Канала 1 будет перенесено с первым фото: "
                 f"{source_skipped['album_groups']}"
             ),
             (
@@ -524,7 +613,8 @@ async def main() -> None:
                 chat_id, f"Перенос начат: 0/{len(pairs)}"
             )
             rows: list[dict[str, object]] = []
-            omitted_media_lines: list[str] = []
+            album_first_media_lines: list[str] = []
+            fallback_lines: list[str] = []
             changed = 0
             already_equal = 0
             failed = 0
@@ -536,12 +626,15 @@ async def main() -> None:
                     "target_id": pair.target.id,
                     "target_date": pair.target.date.isoformat(),
                     "difference_seconds": round(pair.difference_seconds),
-                    "media_omitted": bool(pair.omitted_album_message_ids),
+                    "album_first_media_only": pair.album is not None,
                     "source_album_message_ids": ",".join(
                         str(message_id)
-                        for message_id in pair.omitted_album_message_ids
+                        for message_id in (
+                            pair.album.message_ids if pair.album is not None else ()
+                        )
                     ),
                     "status": "",
+                    "fallback": "",
                     "error": "",
                 }
                 try:
@@ -549,26 +642,49 @@ async def main() -> None:
                         user_client, target.entity, pair
                     )
                     row["status"] = result
-                    if result == "changed":
+                    if result.startswith("changed"):
                         changed += 1
                     else:
                         already_equal += 1
+                    if result in {"changed_text_only", "changed_text_only_plain"}:
+                        row["fallback"] = "media_skipped_full_text_kept"
+                        fallback_lines.append(
+                            f"Исходный №{pair.source.id} → целевой "
+                            f"№{pair.target.id}: медиа пропущено, полный текст сохранён"
+                        )
+                    elif result == "changed_caption_only":
+                        row["fallback"] = "target_media_kept_caption_limited"
+                        fallback_lines.append(
+                            f"Исходный №{pair.source.id} → целевой "
+                            f"№{pair.target.id}: оставлено прежнее медиа, "
+                            "подпись ограничена 1024 символами"
+                        )
                 except Exception as exc:
                     failed += 1
                     row["status"] = "failed"
                     row["error"] = f"{type(exc).__name__}: {exc}"
 
-                if pair.omitted_album_message_ids:
+                if pair.album is not None:
                     album_ids = ", ".join(
                         f"№{message_id}"
-                        for message_id in pair.omitted_album_message_ids
+                        for message_id in pair.album.message_ids
                     )
                     result_label = (
-                        "текст перенесён"
-                        if row["status"] in {"changed", "already_equal"}
-                        else "ошибка переноса"
+                        "перенесено первое фото"
+                        if row["status"]
+                        in {"changed", "changed_reuploaded", "already_equal"}
+                        else (
+                            "фото не принято, применён резервный перенос"
+                            if row["status"]
+                            in {
+                                "changed_text_only",
+                                "changed_text_only_plain",
+                                "changed_caption_only",
+                            }
+                            else "ошибка переноса"
+                        )
                     )
-                    omitted_media_lines.append(
+                    album_first_media_lines.append(
                         f"Исходный альбом {album_ids} → целевой пост "
                         f"№{pair.target.id} ({result_label})"
                     )
@@ -592,16 +708,33 @@ async def main() -> None:
                 log_path,
                 caption=(
                     f"Готово. Изменено: {changed}; уже совпадало: "
-                    f"{already_equal}; ошибок: {failed}; альбомов без фото: "
-                    f"{len(omitted_media_lines)}."
+                    f"{already_equal}; ошибок: {failed}; резервных переносов: "
+                    f"{len(fallback_lines)}; альбомов обработано: "
+                    f"{len(album_first_media_lines)}."
                 ),
             )
 
-            if omitted_media_lines:
-                header = "Посты, в которых фотографии не добавлены:\n\n"
+            if album_first_media_lines:
+                header = "Альбомы, перенесённые только с первым фото:\n\n"
                 chunks: list[str] = []
                 current = header
-                for line in omitted_media_lines:
+                for line in album_first_media_lines:
+                    addition = line + "\n"
+                    if len(current) + len(addition) > 3800:
+                        chunks.append(current.rstrip())
+                        current = addition
+                    else:
+                        current += addition
+                if current.strip():
+                    chunks.append(current.rstrip())
+                for chunk in chunks:
+                    await control_bot.send_message(chat_id, chunk)
+
+            if fallback_lines:
+                header = "Посты, перенесённые в резервном режиме:\n\n"
+                chunks = []
+                current = header
+                for line in fallback_lines:
                     addition = line + "\n"
                     if len(current) + len(addition) > 3800:
                         chunks.append(current.rstrip())
