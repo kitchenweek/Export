@@ -43,6 +43,7 @@ class Pair:
     source: Message
     target: Message
     difference_seconds: float
+    omitted_album_message_ids: tuple[int, ...] = ()
 
 
 def load_saved_owner() -> int | None:
@@ -73,10 +74,20 @@ def is_unsupported_media(message: Message) -> bool:
 
 
 async def load_posts(
-    client: TelegramClient, entity: object
-) -> tuple[list[Message], dict[str, int]]:
+    client: TelegramClient,
+    entity: object,
+    *,
+    allow_albums_without_media: bool = False,
+) -> tuple[list[Message], dict[str, int], dict[int, tuple[int, ...]]]:
     posts: list[Message] = []
-    skipped = {"albums": 0, "unsupported": 0, "empty": 0}
+    album_messages: dict[int, list[Message]] = {}
+    albums_without_media: dict[int, tuple[int, ...]] = {}
+    skipped = {
+        "album_groups": 0,
+        "album_items": 0,
+        "unsupported": 0,
+        "empty": 0,
+    }
 
     async for message in client.iter_messages(entity, reverse=True):
         if message.action is not None:
@@ -85,20 +96,37 @@ async def load_posts(
             skipped["empty"] += 1
             continue
         if message.grouped_id is not None:
-            skipped["albums"] += 1
+            album_messages.setdefault(message.grouped_id, []).append(message)
             continue
         if is_unsupported_media(message):
             skipped["unsupported"] += 1
             continue
         posts.append(message)
 
-    return posts, skipped
+    skipped["album_groups"] = len(album_messages)
+    skipped["album_items"] = sum(len(items) for items in album_messages.values())
+
+    if allow_albums_without_media:
+        for items in album_messages.values():
+            ordered = sorted(items, key=lambda item: (item.date, item.id))
+            captioned = [item for item in ordered if item.raw_text]
+            representative = captioned[0] if captioned else ordered[0]
+            posts.append(representative)
+            albums_without_media[representative.id] = tuple(
+                item.id for item in ordered
+            )
+
+    posts.sort(key=lambda item: (item.date, item.id))
+    return posts, skipped, albums_without_media
 
 
 def build_pairs(
-    source_posts: Sequence[Message], target_posts: Sequence[Message]
+    source_posts: Sequence[Message],
+    target_posts: Sequence[Message],
+    source_albums_without_media: dict[int, tuple[int, ...]] | None = None,
 ) -> list[Pair]:
     """Для каждого source выбирает ближайший ещё не использованный target."""
+    album_map = source_albums_without_media or {}
     available = sorted(
         ((post.date.timestamp(), post.id, post) for post in target_posts),
         key=lambda item: (item[0], item[1]),
@@ -138,6 +166,7 @@ def build_pairs(
                 source=source,
                 target=target,
                 difference_seconds=abs(target_timestamp - source_timestamp),
+                omitted_album_message_ids=album_map.get(source.id, ()),
             )
         )
 
@@ -155,6 +184,50 @@ def format_difference(seconds: float) -> str:
     return f"{days} д. {hours:02}:{minutes:02}"
 
 
+def describe_sent_code(sent_code: types.auth.SentCode) -> str:
+    """Преобразует ответ Telegram в понятное описание доставки кода."""
+    delivery_type = sent_code.type
+    if isinstance(delivery_type, types.auth.SentCodeTypeApp):
+        delivery = (
+            "Код отправлен в системный чат «Telegram» внутри уже "
+            "авторизованного приложения Telegram, не по SMS."
+        )
+    elif isinstance(delivery_type, types.auth.SentCodeTypeSms):
+        delivery = "Код отправлен по SMS."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeCall):
+        delivery = "Код будет продиктован автоматическим телефонным звонком."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeFlashCall):
+        delivery = "Код определяется по номеру входящего flash-звонка."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeMissedCall):
+        delivery = "Код — последние цифры номера пропущенного звонка."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeEmailCode):
+        pattern = getattr(delivery_type, "email_pattern", "указанный адрес")
+        delivery = f"Код отправлен на email: {pattern}."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeFragmentSms):
+        delivery = "Код отправлен через Fragment."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeFirebaseSms):
+        delivery = "Telegram выбрал доставку через защищённый SMS/push."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeSmsWord):
+        delivery = "По SMS отправлено кодовое слово. Пришлите его полностью."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeSmsPhrase):
+        delivery = "По SMS отправлена кодовая фраза. Пришлите её полностью."
+    elif isinstance(delivery_type, types.auth.SentCodeTypeSetUpEmailRequired):
+        delivery = "Telegram требует сначала настроить email для входа."
+    else:
+        delivery = f"Telegram выбрал способ доставки: {type(delivery_type).__name__}."
+
+    length = getattr(delivery_type, "length", None)
+    if isinstance(length, int) and length > 0:
+        delivery += f" Длина кода: {length}."
+    if isinstance(sent_code.timeout, int) and sent_code.timeout > 0:
+        delivery += (
+            f" Повторный запрос станет доступен примерно через "
+            f"{sent_code.timeout} сек."
+        )
+    delivery += " Если код не появился, подождите указанное время и отправьте /resend."
+    return delivery
+
+
 def transferable_media(message: Message) -> object | None:
     if isinstance(message.media, types.MessageMediaWebPage):
         return None
@@ -166,8 +239,12 @@ async def edit_with_flood_wait(
 ) -> str:
     source = pair.source
     target = pair.target
-    source_media = transferable_media(source)
-    source_has_web_preview = isinstance(source.media, types.MessageMediaWebPage)
+    omit_album_media = bool(pair.omitted_album_message_ids)
+    source_media = None if omit_album_media else transferable_media(source)
+    source_has_web_preview = (
+        not omit_album_media
+        and isinstance(source.media, types.MessageMediaWebPage)
+    )
     target_has_attached_media = target.media is not None and not isinstance(
         target.media, types.MessageMediaWebPage
     )
@@ -179,12 +256,16 @@ async def edit_with_flood_wait(
     else:
         file_to_set = None
 
+    text_to_set = source.raw_text or (
+        "Фото не перенесены" if omit_album_media else ""
+    )
+
     while True:
         try:
             await client.edit_message(
                 target_entity,
                 target.id,
-                source.raw_text or "",
+                text_to_set,
                 formatting_entities=source.entities or [],
                 link_preview=source_has_web_preview,
                 file=file_to_set,
@@ -204,6 +285,8 @@ def write_log(rows: Sequence[dict[str, object]]) -> Path:
         "target_id",
         "target_date",
         "difference_seconds",
+        "media_omitted",
+        "source_album_message_ids",
         "status",
         "error",
     ]
@@ -243,6 +326,7 @@ async def main() -> None:
             "Бот переноса постов\n\n"
             f"Пользовательский аккаунт: {status}.\n\n"
             "/login — войти в обычный Telegram-аккаунт\n"
+            "/resend — повторно запросить код входа\n"
             "/migrate — выбрать два канала и начать перенос\n"
             "/status — проверить состояние\n"
             "/cancel — отменить текущий выбор\n"
@@ -353,11 +437,15 @@ async def main() -> None:
         await event.edit("Загружаю всю историю двух каналов и сопоставляю даты…")
         try:
             source_result, target_result = await asyncio.gather(
-                load_posts(user_client, source.entity),
+                load_posts(
+                    user_client,
+                    source.entity,
+                    allow_albums_without_media=True,
+                ),
                 load_posts(user_client, target.entity),
             )
-            source_posts, source_skipped = source_result
-            target_posts, target_skipped = target_result
+            source_posts, source_skipped, source_albums = source_result
+            target_posts, target_skipped, _ = target_result
         except errors.RPCError as exc:
             await event.edit(f"Не удалось загрузить историю: {type(exc).__name__}: {exc}")
             migration_state.clear()
@@ -371,7 +459,7 @@ async def main() -> None:
             migration_state.clear()
             return
 
-        pairs = build_pairs(source_posts, target_posts)
+        pairs = build_pairs(source_posts, target_posts, source_albums)
         migration_state["pairs"] = pairs
         migration_state["stage"] = "confirm"
 
@@ -382,8 +470,12 @@ async def main() -> None:
             f"Канал 2: {channel_title(target, 80)} — {len(target_posts)} постов",
             f"Будет обработано: {len(pairs)} пар",
             (
-                "Пропущено элементов альбомов: "
-                f"{source_skipped['albums'] + target_skipped['albums']}"
+                "Альбомов Канала 1 будет перенесено без фото: "
+                f"{source_skipped['album_groups']}"
+            ),
+            (
+                "Элементов альбомов Канала 2 пропущено: "
+                f"{target_skipped['album_items']}"
             ),
             "",
             "Первые пары:",
@@ -432,6 +524,7 @@ async def main() -> None:
                 chat_id, f"Перенос начат: 0/{len(pairs)}"
             )
             rows: list[dict[str, object]] = []
+            omitted_media_lines: list[str] = []
             changed = 0
             already_equal = 0
             failed = 0
@@ -443,6 +536,11 @@ async def main() -> None:
                     "target_id": pair.target.id,
                     "target_date": pair.target.date.isoformat(),
                     "difference_seconds": round(pair.difference_seconds),
+                    "media_omitted": bool(pair.omitted_album_message_ids),
+                    "source_album_message_ids": ",".join(
+                        str(message_id)
+                        for message_id in pair.omitted_album_message_ids
+                    ),
                     "status": "",
                     "error": "",
                 }
@@ -459,6 +557,21 @@ async def main() -> None:
                     failed += 1
                     row["status"] = "failed"
                     row["error"] = f"{type(exc).__name__}: {exc}"
+
+                if pair.omitted_album_message_ids:
+                    album_ids = ", ".join(
+                        f"№{message_id}"
+                        for message_id in pair.omitted_album_message_ids
+                    )
+                    result_label = (
+                        "текст перенесён"
+                        if row["status"] in {"changed", "already_equal"}
+                        else "ошибка переноса"
+                    )
+                    omitted_media_lines.append(
+                        f"Исходный альбом {album_ids} → целевой пост "
+                        f"№{pair.target.id} ({result_label})"
+                    )
                 rows.append(row)
 
                 if index % 20 == 0 or index == len(pairs):
@@ -479,9 +592,26 @@ async def main() -> None:
                 log_path,
                 caption=(
                     f"Готово. Изменено: {changed}; уже совпадало: "
-                    f"{already_equal}; ошибок: {failed}."
+                    f"{already_equal}; ошибок: {failed}; альбомов без фото: "
+                    f"{len(omitted_media_lines)}."
                 ),
             )
+
+            if omitted_media_lines:
+                header = "Посты, в которых фотографии не добавлены:\n\n"
+                chunks: list[str] = []
+                current = header
+                for line in omitted_media_lines:
+                    addition = line + "\n"
+                    if len(current) + len(addition) > 3800:
+                        chunks.append(current.rstrip())
+                        current = addition
+                    else:
+                        current += addition
+                if current.strip():
+                    chunks.append(current.rstrip())
+                for chunk in chunks:
+                    await control_bot.send_message(chat_id, chunk)
             migration_state.clear()
 
     @control_bot.on(events.NewMessage(incoming=True))
@@ -538,6 +668,35 @@ async def main() -> None:
             )
             return
 
+        if text == "/resend":
+            if login_state.get("step") != "code":
+                await event.respond(
+                    "Сейчас нет ожидающего кода. Сначала отправьте /login и номер."
+                )
+                return
+            phone = str(login_state.get("phone", ""))
+            try:
+                sent_code = await user_client.send_code_request(phone)
+            except errors.FloodWaitError as exc:
+                await event.respond(
+                    f"Telegram пока запрещает повторный запрос. Подождите "
+                    f"{exc.seconds} секунд."
+                )
+                return
+            except errors.PhoneCodeExpiredError:
+                login_state.clear()
+                login_state["step"] = "idle"
+                await event.respond("Старый запрос истёк. Запустите /login заново.")
+                return
+            except errors.RPCError as exc:
+                await event.respond(
+                    f"Telegram отклонил повторный запрос: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
+            await event.respond(describe_sent_code(sent_code))
+            return
+
         if text == "/migrate":
             await begin_migration(sender_id)
             return
@@ -559,7 +718,7 @@ async def main() -> None:
                 await event.respond("Неверный формат. Пример: +491234567890")
                 return
             try:
-                await user_client.send_code_request(phone)
+                sent_code = await user_client.send_code_request(phone)
             except errors.PhoneNumberInvalidError:
                 await event.respond("Telegram не принял этот номер. Проверьте его.")
                 return
@@ -568,19 +727,31 @@ async def main() -> None:
                     f"Слишком много попыток. Подождите {exc.seconds} секунд."
                 )
                 return
+            except errors.RPCError as exc:
+                await event.respond(
+                    f"Telegram не отправил код: {type(exc).__name__}: {exc}"
+                )
+                return
             login_state["phone"] = phone
             login_state["step"] = "code"
             await delete_sensitive(event)
             await control_bot.send_message(
                 sender_id,
-                "Telegram отправил код входа. Пришлите его сюда. Сообщение с "
-                "кодом будет сразу удалено ботом.",
+                describe_sent_code(sent_code)
+                + "\n\nПришлите полученный код сюда. Сообщение с кодом "
+                "будет сразу удалено ботом.",
             )
             return
 
         if step == "code":
             phone = str(login_state.get("phone", ""))
-            code = "".join(character for character in text if character.isdigit())
+            # Обычный цифровой код можно прислать с пробелами. Кодовое слово
+            # или фразу, если Telegram выбрал такой способ, сохраняем как есть.
+            digits_only = "".join(
+                character for character in text if character.isdigit()
+            )
+            has_letters = any(character.isalpha() for character in text)
+            code = text.strip() if has_letters else digits_only
             await delete_sensitive(event)
             try:
                 await user_client.sign_in(phone=phone, code=code)
