@@ -15,6 +15,7 @@ import html
 import logging
 import os
 import re
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -24,9 +25,10 @@ from dotenv import load_dotenv
 from sqlalchemy import BigInteger, Boolean, DateTime, Integer, String, Text, UniqueConstraint, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, utils
 from telethon.errors import FloodWaitError, PhoneCodeExpiredError, PhoneCodeInvalidError, SessionPasswordNeededError
 from telethon.sessions import StringSession
+from telethon.tl import types
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
@@ -89,11 +91,23 @@ class SavedMessage(Base):
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
 
 
+class SyncState(Base):
+    __tablename__ = "sync_states"
+    owner_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    completed: Mapped[bool] = mapped_column(Boolean, default=False)
+    running: Mapped[bool] = mapped_column(Boolean, default=False)
+    chats_done: Mapped[int] = mapped_column(Integer, default=0)
+    messages_saved: Mapped[int] = mapped_column(Integer, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 engine = create_async_engine(DATABASE_URL, pool_pre_ping=True)
 Session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 bot = TelegramClient(StringSession(), API_ID, API_HASH)
 user_clients: dict[int, TelegramClient] = {}
 login_states: dict[int, dict] = {}
+sync_tasks: dict[int, asyncio.Task] = {}
+owner_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 
 def enc(value: str) -> str:
@@ -119,6 +133,7 @@ def main_buttons(connected: bool, notifications: bool = True):
     if connected:
         rows.extend([
             [Button.inline("🗑 Удалённые чаты", b"chats:0"), Button.inline("✉️ Сообщения Telegram", b"service:0")],
+            [Button.inline("🔄 Синхронизировать старые чаты", b"sync_old")],
             [Button.inline("🔔 Уведомления: " + ("ВКЛ" if notifications else "ВЫКЛ"), b"toggle")],
             [Button.inline("👤 Аккаунт", b"account"), Button.inline("⚙️ Помощь", b"help")],
         ])
@@ -153,27 +168,29 @@ async def safe_delete_message(event):
         pass
 
 
+async def download_message_media(owner_id: int, chat_id: int, message) -> Optional[str]:
+    size = getattr(getattr(message, "file", None), "size", None) or 0
+    if not message.media or not MAX_MEDIA_MB or size > MAX_MEDIA_MB * 1024 * 1024:
+        return None
+    folder = MEDIA_DIR / str(owner_id) / str(chat_id)
+    folder.mkdir(parents=True, exist_ok=True)
+    try:
+        downloaded = await message.download_media(file=str(folder / str(message.id)))
+        return str(Path(downloaded).resolve()) if downloaded else None
+    except Exception as exc:
+        log.warning("Не удалось сохранить медиа owner=%s chat=%s msg=%s: %s", owner_id, chat_id, message.id, exc)
+        return None
+
+
 async def save_message(owner_id: int, event):
-    message = event.message
-    chat_id = event.chat_id
+    message, chat_id = event.message, event.chat_id
     if chat_id is None:
         return
     try:
         chat, sender = await asyncio.gather(event.get_chat(), event.get_sender())
     except Exception:
         chat, sender = None, None
-
-    media_path = None
-    size = getattr(getattr(message, "file", None), "size", None) or 0
-    if message.media and MAX_MEDIA_MB and (not size or size <= MAX_MEDIA_MB * 1024 * 1024):
-        folder = MEDIA_DIR / str(owner_id) / str(chat_id)
-        folder.mkdir(parents=True, exist_ok=True)
-        try:
-            downloaded = await message.download_media(file=str(folder / str(message.id)))
-            media_path = str(Path(downloaded).resolve()) if downloaded else None
-        except Exception as exc:
-            log.warning("Не удалось сохранить медиа owner=%s chat=%s msg=%s: %s", owner_id, chat_id, message.id, exc)
-
+    media_path = await download_message_media(owner_id, chat_id, message)
     values = dict(
         owner_id=owner_id,
         chat_id=chat_id,
@@ -185,25 +202,150 @@ async def save_message(owner_id: int, event):
         media_path=media_path,
         sent_at=message.date,
     )
-    async with Session() as db:
-        existing = await db.scalar(select(SavedMessage).where(
-            SavedMessage.owner_id == owner_id,
-            SavedMessage.chat_id == chat_id,
-            SavedMessage.message_id == message.id,
-        ))
-        if existing:
-            for key, value in values.items():
-                if key not in {"owner_id", "chat_id", "message_id"}:
-                    setattr(existing, key, value)
-        else:
-            db.add(SavedMessage(**values))
-        await db.commit()
+    async with owner_locks[owner_id]:
+        async with Session() as db:
+            existing = await db.scalar(select(SavedMessage).where(
+                SavedMessage.owner_id == owner_id,
+                SavedMessage.chat_id == chat_id,
+                SavedMessage.message_id == message.id,
+            ))
+            if existing:
+                for key, value in values.items():
+                    if key not in {"owner_id", "chat_id", "message_id"}:
+                        setattr(existing, key, value)
+            else:
+                db.add(SavedMessage(**values))
+            await db.commit()
 
     if chat_id == 777000:
         account = await account_for(owner_id)
         if account and account.notifications:
             body = html.escape((message.raw_text or "[медиа]")[:3500])
             await bot.send_message(owner_id, f"✉️ <b>Новое сообщение от Telegram</b>\n\n{body}", parse_mode="html")
+
+
+async def save_history_batch(owner_id: int, chat_id: int, chat_title: str, messages: list) -> int:
+    """Сохраняет пакет старых сообщений без уведомлений и повторной загрузки медиа."""
+    ids = [message.id for message in messages]
+    async with owner_locks[owner_id]:
+        async with Session() as db:
+            existing_ids = set((await db.scalars(select(SavedMessage.message_id).where(
+                SavedMessage.owner_id == owner_id,
+                SavedMessage.chat_id == chat_id,
+                SavedMessage.message_id.in_(ids),
+            ))).all())
+            added = 0
+            for message in messages:
+                if message.id in existing_ids:
+                    continue
+                try:
+                    sender = await message.get_sender()
+                except Exception:
+                    sender = None
+                db.add(SavedMessage(
+                    owner_id=owner_id,
+                    chat_id=chat_id,
+                    message_id=message.id,
+                    chat_title=chat_title[:255],
+                    sender_id=getattr(sender, "id", None),
+                    sender_name=display_name(sender)[:255],
+                    text=message.raw_text or "",
+                    media_path=None,
+                    sent_at=message.date,
+                ))
+                added += 1
+            await db.commit()
+            return added
+
+
+async def set_sync_state(owner_id: int, *, completed: bool, running: bool, chats: int, saved: int):
+    async with Session() as db:
+        state = await db.get(SyncState, owner_id)
+        if state is None:
+            state = SyncState(owner_id=owner_id)
+            db.add(state)
+        state.completed = completed
+        state.running = running
+        state.chats_done = chats
+        state.messages_saved = saved
+        state.updated_at = datetime.now(timezone.utc)
+        await db.commit()
+
+
+async def sync_old_history(owner_id: int, client: TelegramClient):
+    chats_done = saved = 0
+    status_message = None
+    await set_sync_state(owner_id, completed=False, running=True, chats=0, saved=0)
+    try:
+        try:
+            status_message = await bot.send_message(
+                owner_id,
+                "🔄 Началась синхронизация старых чатов. Бот продолжает работать в обычном режиме."
+            )
+        except Exception:
+            pass
+        async for dialog in client.iter_dialogs():
+            if not client.is_connected():
+                raise RuntimeError("Аккаунт отключён во время синхронизации")
+            chat_id = dialog.id
+            batch = []
+            try:
+                async for message in client.iter_messages(dialog.entity):
+                    batch.append(message)
+                    if len(batch) >= 100:
+                        saved += await save_history_batch(owner_id, chat_id, dialog.name or "Без названия", batch)
+                        batch.clear()
+                if batch:
+                    saved += await save_history_batch(owner_id, chat_id, dialog.name or "Без названия", batch)
+            except FloodWaitError as exc:
+                log.warning("Синхронизация chat=%s приостановлена Telegram на %s сек.", chat_id, exc.seconds)
+                await asyncio.sleep(exc.seconds + 1)
+            except Exception as exc:
+                log.warning("Не удалось синхронизировать owner=%s chat=%s: %s", owner_id, chat_id, exc)
+            chats_done += 1
+            if chats_done % 5 == 0:
+                await set_sync_state(owner_id, completed=False, running=True, chats=chats_done, saved=saved)
+                if status_message:
+                    try:
+                        await status_message.edit(f"🔄 Синхронизация: обработано чатов — {chats_done}, сохранено сообщений — {saved}.")
+                    except Exception:
+                        pass
+        await set_sync_state(owner_id, completed=True, running=False, chats=chats_done, saved=saved)
+        final_text = f"✅ Старые чаты синхронизированы. Обработано чатов: {chats_done}, добавлено сообщений: {saved}."
+        if status_message:
+            try:
+                await status_message.edit(final_text)
+            except Exception:
+                pass
+        else:
+            try:
+                await bot.send_message(owner_id, final_text)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
+        await set_sync_state(owner_id, completed=False, running=False, chats=chats_done, saved=saved)
+        raise
+    except Exception as exc:
+        await set_sync_state(owner_id, completed=False, running=False, chats=chats_done, saved=saved)
+        log.exception("Ошибка синхронизации owner=%s: %s", owner_id, exc)
+        try:
+            await bot.send_message(owner_id, "⚠️ Синхронизация остановилась. Её можно повторить кнопкой в меню.")
+        except Exception:
+            pass
+    finally:
+        sync_tasks.pop(owner_id, None)
+
+
+async def schedule_sync(owner_id: int, client: TelegramClient, force: bool = False) -> bool:
+    current = sync_tasks.get(owner_id)
+    if current and not current.done():
+        return False
+    async with Session() as db:
+        state = await db.get(SyncState, owner_id)
+    if state and state.completed and not force:
+        return False
+    sync_tasks[owner_id] = asyncio.create_task(sync_old_history(owner_id, client))
+    return True
 
 
 def deletion_text(item: SavedMessage) -> str:
@@ -217,23 +359,12 @@ def deletion_text(item: SavedMessage) -> str:
     )
 
 
-async def mark_deleted(owner_id: int, event):
-    ids = list(event.deleted_ids)
-    if not ids:
-        return
-    conditions = [SavedMessage.owner_id == owner_id, SavedMessage.message_id.in_(ids), SavedMessage.deleted_at.is_(None)]
-    if event.chat_id is not None:
-        conditions.append(SavedMessage.chat_id == event.chat_id)
-    async with Session() as db:
-        items = list((await db.scalars(select(SavedMessage).where(*conditions))).all())
-        now = datetime.now(timezone.utc)
-        for item in items:
-            item.deleted_at = now
-        await db.commit()
+async def notify_deleted(owner_id: int, items: list[SavedMessage]):
     account = await account_for(owner_id)
     if not account or not account.notifications:
         return
-    for item in items:
+    notify_limit = 20
+    for item in items[:notify_limit]:
         try:
             if item.media_path and Path(item.media_path).is_file():
                 await bot.send_file(owner_id, item.media_path, caption=deletion_text(item), parse_mode="html")
@@ -241,6 +372,41 @@ async def mark_deleted(owner_id: int, event):
                 await bot.send_message(owner_id, deletion_text(item), parse_mode="html")
         except Exception as exc:
             log.warning("Не удалось отправить уведомление owner=%s: %s", owner_id, exc)
+    if len(items) > notify_limit:
+        await bot.send_message(owner_id, f"🗑 Одновременно удалено ещё сообщений: {len(items) - notify_limit}. Они доступны в архиве.")
+
+
+async def mark_deleted_ids(owner_id: int, ids: list[int], chat_id: Optional[int] = None):
+    if not ids:
+        return
+    conditions = [SavedMessage.owner_id == owner_id, SavedMessage.message_id.in_(ids), SavedMessage.deleted_at.is_(None)]
+    if chat_id is not None:
+        conditions.append(SavedMessage.chat_id == chat_id)
+    async with owner_locks[owner_id]:
+        async with Session() as db:
+            items = list((await db.scalars(select(SavedMessage).where(*conditions))).all())
+            now = datetime.now(timezone.utc)
+            for item in items:
+                item.deleted_at = now
+            await db.commit()
+    await notify_deleted(owner_id, items)
+
+
+async def mark_channel_history_unavailable(owner_id: int, chat_id: int, available_min_id: int):
+    conditions = [
+        SavedMessage.owner_id == owner_id,
+        SavedMessage.chat_id == chat_id,
+        SavedMessage.message_id < available_min_id,
+        SavedMessage.deleted_at.is_(None),
+    ]
+    async with owner_locks[owner_id]:
+        async with Session() as db:
+            items = list((await db.scalars(select(SavedMessage).where(*conditions))).all())
+            now = datetime.now(timezone.utc)
+            for item in items:
+                item.deleted_at = now
+            await db.commit()
+    await notify_deleted(owner_id, items)
 
 
 async def start_user_client(owner_id: int, session_string: str) -> TelegramClient:
@@ -257,9 +423,17 @@ async def start_user_client(owner_id: int, session_string: str) -> TelegramClien
     async def on_edit(event):
         await save_message(owner_id, event)
 
-    @client.on(events.MessageDeleted())
-    async def on_delete(event):
-        await mark_deleted(owner_id, event)
+    @client.on(events.Raw())
+    async def on_raw_delete(update_event):
+        if isinstance(update_event, types.UpdateDeleteMessages):
+            # В личных чатах ID сообщений глобальны для аккаунта, поэтому peer не требуется.
+            await mark_deleted_ids(owner_id, list(update_event.messages))
+        elif isinstance(update_event, types.UpdateDeleteChannelMessages):
+            channel_chat_id = utils.get_peer_id(types.PeerChannel(update_event.channel_id))
+            await mark_deleted_ids(owner_id, list(update_event.messages), channel_chat_id)
+        elif isinstance(update_event, types.UpdateChannelAvailableMessages):
+            channel_chat_id = utils.get_peer_id(types.PeerChannel(update_event.channel_id))
+            await mark_channel_history_unavailable(owner_id, channel_chat_id, update_event.available_min_id)
 
     await client.connect()
     if not await client.is_user_authorized():
@@ -268,6 +442,7 @@ async def start_user_client(owner_id: int, session_string: str) -> TelegramClien
     user_clients[owner_id] = client
     me = await client.get_me()
     log.info("Аккаунт %s запущен для owner=%s", getattr(me, "id", "?"), owner_id)
+    await schedule_sync(owner_id, client)
     return client
 
 
@@ -331,7 +506,7 @@ async def input_handler(event):
         try:
             await state["client"].sign_in(state["phone"], code, phone_code_hash=state["phone_code_hash"])
             await finish_login(owner_id, state["client"], state["phone"])
-            await bot.send_message(owner_id, "✅ Аккаунт подключён. С этого момента новые сообщения сохраняются.", buttons=main_buttons(True))
+            await bot.send_message(owner_id, "✅ Аккаунт подключён. Началась синхронизация старых чатов; новые сообщения уже сохраняются.", buttons=main_buttons(True))
         except SessionPasswordNeededError:
             state["step"] = "password"
             await bot.send_message(owner_id, "На аккаунте включён облачный пароль. Введите пароль 2FA — сообщение будет удалено после обработки.", buttons=[[Button.inline("Отмена", b"cancel_login")]])
@@ -344,7 +519,7 @@ async def input_handler(event):
         try:
             await state["client"].sign_in(password=value)
             await finish_login(owner_id, state["client"], state["phone"])
-            await bot.send_message(owner_id, "✅ Аккаунт подключён. С этого момента новые сообщения сохраняются.", buttons=main_buttons(True))
+            await bot.send_message(owner_id, "✅ Аккаунт подключён. Началась синхронизация старых чатов; новые сообщения уже сохраняются.", buttons=main_buttons(True))
         except Exception as exc:
             await event.respond(f"Пароль не принят: {html.escape(str(exc))}", parse_mode="html")
 
@@ -377,13 +552,29 @@ async def callback_handler(event):
                 account.notifications = not account.notifications
                 await db.commit()
         await show_main(event)
+    elif data == "sync_old":
+        client = user_clients.get(owner_id)
+        if not client:
+            await show_main(event, "Сначала подключите аккаунт.")
+            return
+        started = await schedule_sync(owner_id, client, force=True)
+        await show_main(event, "Синхронизация старых чатов запущена." if started else "Синхронизация уже выполняется.")
     elif data == "account":
         account = await account_for(owner_id)
         if not account or not account.session_enc:
             await show_main(event, "Аккаунт не подключён.")
             return
         phone = html.escape(account.phone or "не указан")
-        await event.edit(f"<b>Подключённый аккаунт</b>\n\nТелефон: <code>{phone}</code>", buttons=[
+        async with Session() as db:
+            sync_state = await db.get(SyncState, owner_id)
+        if sync_state and sync_state.running:
+            sync_text = f"🔄 идёт синхронизация: {sync_state.chats_done} чатов"
+        elif sync_state and sync_state.completed:
+            sync_text = f"✅ синхронизировано чатов: {sync_state.chats_done}"
+        else:
+            sync_text = "⏳ синхронизация ещё не завершена"
+        await event.edit(f"<b>Подключённый аккаунт</b>\n\nТелефон: <code>{phone}</code>\nИстория: {sync_text}", buttons=[
+            [Button.inline("🔄 Повторить синхронизацию", b"sync_old")],
             [Button.inline("Отключить аккаунт", b"disconnect_confirm")],
             [Button.inline("Очистить архив", b"clear_confirm")],
             [Button.inline("◀️ Назад", b"menu")],
@@ -393,6 +584,9 @@ async def callback_handler(event):
             [Button.inline("Да, отключить", b"disconnect"), Button.inline("Отмена", b"account")]
         ])
     elif data == "disconnect":
+        task = sync_tasks.get(owner_id)
+        if task and not task.done():
+            task.cancel()
         client = user_clients.pop(owner_id, None)
         if client:
             await client.log_out()
@@ -488,9 +682,11 @@ async def callback_handler(event):
     elif data == "help":
         await event.edit(
             "<b>Как это работает</b>\n\n"
-            "После подключения аккаунта сервис сохраняет новые сообщения и отмечает их при событии удаления. "
-            "Сообщения, удалённые до подключения или пока сервер был выключен, восстановить невозможно. "
-            "Секретные чаты Telegram API недоступны. Медиа сохраняются только в пределах установленного лимита.\n\n"
+            "После подключения сервис синхронизирует доступную старую переписку и сохраняет все новые сообщения. "
+            "После этого он фиксирует удаление как чужих, так и ваших исходящих сообщений. "
+            "Сообщения, уже удалённые до первой синхронизации или пока сервер был выключен, восстановить невозможно. "
+            "Секретные чаты Telegram API недоступны. При первой синхронизации сохраняются текст и метаданные; "
+            "медиа сохраняются для новых сообщений в пределах установленного лимита.\n\n"
             "Подключайте только собственный аккаунт. Не передавайте доступ к управляющему боту другим людям.",
             buttons=[[Button.inline("◀️ Назад", b"menu")]], parse_mode="html"
         )
@@ -516,6 +712,11 @@ async def main():
     try:
         await bot.run_until_disconnected()
     finally:
+        for task in list(sync_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if sync_tasks:
+            await asyncio.gather(*list(sync_tasks.values()), return_exceptions=True)
         for client in list(user_clients.values()):
             await client.disconnect()
         await engine.dispose()
