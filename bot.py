@@ -1,8 +1,8 @@
 """Telegram-архив удалённых сообщений.
 
-API_ID, API_HASH и BOT_TOKEN уже указаны в коде.
-Перед запуском задайте DATABASE_URL и SESSION_SECRET.
-Дополнительно: MEDIA_DIR, MAX_MEDIA_MB и LOG_LEVEL.
+API_ID, API_HASH и BOT_TOKEN уже указаны в коде. Без настроек используется
+локальная SQLite-база bot.db. При желании PostgreSQL можно подключить через
+DATABASE_URL. Дополнительно: SESSION_SECRET, MEDIA_DIR, MAX_MEDIA_MB, LOG_LEVEL.
 
 Установка: pip install -r requirements.txt
 Запуск: python bot.py
@@ -45,14 +45,18 @@ def required(name: str) -> str:
 API_ID = 32200104
 API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
 BOT_TOKEN = "8605386447:AAHnZAM-HfL0o7g-dzj9SaayWhpQKMp-xLs"
-DATABASE_URL = required("DATABASE_URL").replace("postgres://", "postgresql+asyncpg://", 1).replace(
-    "postgresql://", "postgresql+asyncpg://", 1
-)
+database_value = os.getenv("DATABASE_URL", "").strip()
+if database_value:
+    DATABASE_URL = database_value.replace("postgres://", "postgresql+asyncpg://", 1).replace(
+        "postgresql://", "postgresql+asyncpg://", 1
+    )
+else:
+    DATABASE_URL = "sqlite+aiosqlite:///./bot.db"
 MEDIA_DIR = Path(os.getenv("MEDIA_DIR", "./data/media")).resolve()
 MAX_MEDIA_MB = max(0, int(os.getenv("MAX_MEDIA_MB", "20")))
 PAGE_SIZE = 5
 
-secret = required("SESSION_SECRET").encode()
+secret = (os.getenv("SESSION_SECRET", "").strip() or "telegram-deleted-archive-session-key-v1").encode()
 FERNET = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret).digest()))
 
 
