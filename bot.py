@@ -23,13 +23,6 @@ BOT_TOKEN = os.getenv(
     "8797332751:AAE_WMFhyYtNXrhyIq-xCky50Dzynlz3Xco",
 )
 
-# Обязательно заполните. Примеры: @source_channel, -1001234567890.
-SOURCE_CHANNEL = os.getenv("SOURCE_CHANNEL", "@source_channel")
-TARGET_CHANNEL = os.getenv("TARGET_CHANNEL", "@target_channel")
-
-# Ваш цифровой Telegram ID. Узнать его можно у @userinfobot.
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-
 # Сессия пользовательского аккаунта, который состоит в основном канале и имеет
 # право редактировать второй. Создаётся командой: python bot.py --login
 USER_SESSION = os.getenv("USER_SESSION", "")
@@ -72,9 +65,27 @@ class SyncIssue:
     details: str
 
 
+@dataclass
+class ChannelSelection:
+    channels: list[types.Channel]
+    phase: str = "source"
+    source: Optional[types.Channel] = None
+
+
 bot_client = TelegramClient("channel_sync_bot", API_ID, API_HASH)
 worker_client = TelegramClient(StringSession(USER_SESSION), API_ID, API_HASH)
 sync_lock = asyncio.Lock()
+worker_ready = False
+selections: dict[int, ChannelSelection] = {}
+
+
+def configuration_issues() -> list[str]:
+    issues: list[str] = []
+    if not USER_SESSION:
+        issues.append("не указан USER_SESSION")
+    elif not worker_ready:
+        issues.append("USER_SESSION недействительна или рабочий аккаунт не подключён")
+    return issues
 
 
 def message_link(entity, message_id: int) -> str:
@@ -205,9 +216,9 @@ async def replace_post(target_entity, target: Post, source: Post, temp_dir: Path
             downloaded_path.unlink(missing_ok=True)
 
 
-async def run_sync(progress_callback=None):
-    source_entity = await worker_client.get_entity(SOURCE_CHANNEL)
-    target_entity = await worker_client.get_entity(TARGET_CHANNEL)
+async def run_sync(source_channel, target_channel, progress_callback=None):
+    source_entity = await worker_client.get_entity(source_channel)
+    target_entity = await worker_client.get_entity(target_channel)
     if source_entity.id == target_entity.id:
         raise RuntimeError("основной и второй канал не должны быть одним каналом")
     source_posts, target_posts = await asyncio.gather(
@@ -316,53 +327,59 @@ def split_report(text: str, limit: int = MAX_REPORT_PART) -> list[str]:
     return parts
 
 
-def authorized(event) -> bool:
-    return bool(ADMIN_ID and event.is_private and event.sender_id == ADMIN_ID)
+def can_edit_channel(channel: types.Channel) -> bool:
+    if getattr(channel, "creator", False):
+        return True
+    rights = getattr(channel, "admin_rights", None)
+    return bool(rights and rights.edit_messages)
 
 
-@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
-async def start_handler(event):
-    if not authorized(event):
+async def available_channels() -> list[types.Channel]:
+    channels: list[types.Channel] = []
+    async for dialog in worker_client.iter_dialogs():
+        entity = dialog.entity
+        if isinstance(entity, types.Channel) and entity.broadcast:
+            channels.append(entity)
+    channels.sort(key=lambda item: (item.title or "").casefold())
+    return channels
+
+
+def channel_label(channel: types.Channel) -> str:
+    username = f"@{channel.username}" if channel.username else "приватный"
+    editable = "можно изменять" if can_edit_channel(channel) else "только чтение"
+    return f"{channel.title} — {username}, {editable}"
+
+
+async def send_channel_list(event, channels: list[types.Channel]):
+    lines = [
+        "Выберите каналы из списка. Каналом назначения может быть только канал "
+        "с пометкой «можно изменять».\n"
+    ]
+    for index, channel in enumerate(channels, start=1):
+        lines.append(f"{index}. {channel_label(channel)}")
+
+    for part in split_report("\n".join(lines)):
+        await event.respond(part, parse_mode=None, link_preview=False)
+
+
+async def execute_sync(event, source_channel, target_channel):
+    async with sync_lock:
         await event.respond(
-            "Доступ запрещён. Владелец должен указать свой ADMIN_ID в настройках.",
+            f"Основной канал: {source_channel.title}\n"
+            f"Второй канал: {target_channel.title}\n"
+            "Загружаю списки постов…",
             parse_mode=None,
         )
-        return
-    await event.respond(
-        "Бот готов. Команда /sync запускает перенос, /status показывает настройки.",
-        parse_mode=None,
-    )
-
-
-@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
-async def status_handler(event):
-    if not authorized(event):
-        return
-    await event.respond(
-        "Настройки:\n"
-        f"Основной канал: {SOURCE_CHANNEL}\n"
-        f"Второй канал: {TARGET_CHANNEL}\n"
-        f"Задержка: {MIN_DELAY:.2f}–{MAX_DELAY:.2f} сек.",
-        parse_mode=None,
-    )
-
-
-@bot_client.on(events.NewMessage(pattern=r"^/sync(?:@\w+)?$"))
-async def sync_handler(event):
-    if not authorized(event):
-        return
-    if sync_lock.locked():
-        await event.respond("Синхронизация уже выполняется.", parse_mode=None)
-        return
-
-    async with sync_lock:
-        await event.respond("Загружаю списки постов…", parse_mode=None)
 
         async def send_progress(text: str):
             await event.respond(text, parse_mode=None)
 
         try:
-            changed, total, issues = await run_sync(send_progress)
+            changed, total, issues = await run_sync(
+                source_channel,
+                target_channel,
+                send_progress,
+            )
             report = build_report(changed, total, issues)
         except Exception as error:
             log.exception("Критическая ошибка синхронизации")
@@ -373,6 +390,138 @@ async def sync_handler(event):
 
         for part in split_report(report):
             await event.respond(part, link_preview=False, parse_mode=None)
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/start(?:@\w+)?$"))
+async def start_handler(event):
+    if not event.is_private:
+        return
+    await event.respond(
+        "Бот готов. Команда /sync открывает выбор каналов. "
+        "/cancel отменяет выбор, /status показывает состояние.",
+        parse_mode=None,
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/status(?:@\w+)?$"))
+async def status_handler(event):
+    if not event.is_private:
+        return
+    issues = configuration_issues()
+    readiness = "готов к переносу" if not issues else "не готов: " + "; ".join(issues)
+    await event.respond(
+        "Состояние бота:\n"
+        f"Задержка: {MIN_DELAY:.2f}–{MAX_DELAY:.2f} сек.\n"
+        "Каналы выбираются после команды /sync.\n"
+        f"Состояние: {readiness}",
+        parse_mode=None,
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/sync(?:@\w+)?$"))
+async def sync_handler(event):
+    if not event.is_private:
+        return
+    issues = configuration_issues()
+    if issues:
+        await event.respond(
+            "Перенос пока нельзя запустить:\n— " + "\n— ".join(issues),
+            parse_mode=None,
+        )
+        return
+    if sync_lock.locked():
+        await event.respond("Синхронизация уже выполняется.", parse_mode=None)
+        return
+    await event.respond("Загружаю доступные каналы…", parse_mode=None)
+    try:
+        channels = await available_channels()
+    except Exception as error:
+        await event.respond(
+            f"Не удалось получить список каналов: {type(error).__name__}: {error}",
+            parse_mode=None,
+        )
+        return
+    if len(channels) < 2:
+        await event.respond(
+            "Рабочий аккаунт должен состоять как минимум в двух каналах.",
+            parse_mode=None,
+        )
+        return
+
+    selections[event.sender_id] = ChannelSelection(channels=channels)
+    await send_channel_list(event, channels)
+    await event.respond(
+        "Отправьте номер ОСНОВНОГО канала или /cancel для отмены.",
+        parse_mode=None,
+    )
+
+
+@bot_client.on(events.NewMessage(pattern=r"^/cancel(?:@\w+)?$"))
+async def cancel_handler(event):
+    if not event.is_private:
+        return
+    removed = selections.pop(event.sender_id, None)
+    text = "Выбор каналов отменён." if removed else "Сейчас нет активного выбора."
+    await event.respond(text, parse_mode=None)
+
+
+@bot_client.on(events.NewMessage(incoming=True))
+async def selection_handler(event):
+    if not event.is_private or not event.sender_id:
+        return
+    text = (event.raw_text or "").strip()
+    if not text or text.startswith("/"):
+        return
+    state = selections.get(event.sender_id)
+    if not state:
+        return
+
+    try:
+        number = int(text)
+    except ValueError:
+        await event.respond("Отправьте только номер канала из списка.", parse_mode=None)
+        return
+    if not 1 <= number <= len(state.channels):
+        await event.respond(
+            f"Введите число от 1 до {len(state.channels)}.",
+            parse_mode=None,
+        )
+        return
+
+    selected = state.channels[number - 1]
+    if state.phase == "source":
+        state.source = selected
+        state.phase = "target"
+        await event.respond(
+            f"Основной канал выбран: {selected.title}\n\n"
+            "Теперь отправьте номер ВТОРОГО канала, посты которого нужно изменить.",
+            parse_mode=None,
+        )
+        return
+
+    if state.source and selected.id == state.source.id:
+        await event.respond(
+            "Основной и второй канал не должны совпадать. Выберите другой номер.",
+            parse_mode=None,
+        )
+        return
+    if not can_edit_channel(selected):
+        await event.respond(
+            "Рабочий аккаунт не имеет права изменять посты в этом канале. "
+            "Выберите канал с пометкой «можно изменять».",
+            parse_mode=None,
+        )
+        return
+    if sync_lock.locked():
+        await event.respond(
+            "Сейчас уже выполняется другая синхронизация. Повторите номер позже.",
+            parse_mode=None,
+        )
+        return
+
+    source = state.source
+    selections.pop(event.sender_id, None)
+    await execute_sync(event, source, selected)
 
 
 async def create_user_session():
@@ -386,29 +535,38 @@ async def create_user_session():
 
 
 async def main():
+    global worker_ready
+
     if not API_HASH or not BOT_TOKEN:
         raise RuntimeError("Не заполнены API_HASH или BOT_TOKEN")
-    if ADMIN_ID <= 0:
-        raise RuntimeError("Укажите ADMIN_ID — ваш цифровой Telegram ID")
-    if SOURCE_CHANNEL == "@source_channel" or TARGET_CHANNEL == "@target_channel":
-        raise RuntimeError("Укажите SOURCE_CHANNEL и TARGET_CHANNEL")
-    if not USER_SESSION:
-        raise RuntimeError(
-            "Не заполнен USER_SESSION. Один раз выполните локально: python bot.py --login"
-        )
 
-    await worker_client.connect()
-    if not await worker_client.is_user_authorized():
-        raise RuntimeError("USER_SESSION недействительна или отозвана")
+    worker = None
+    if USER_SESSION:
+        try:
+            await worker_client.connect()
+            worker_ready = await worker_client.is_user_authorized()
+            if worker_ready:
+                worker = await worker_client.get_me()
+            else:
+                log.error("USER_SESSION недействительна или отозвана")
+        except Exception:
+            worker_ready = False
+            log.exception("Не удалось подключить рабочий аккаунт")
+    else:
+        log.warning(
+            "USER_SESSION не указана. Бот запустится, но /sync будет недоступна. "
+            "Создайте сессию командой: python bot.py --login"
+        )
 
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
-    worker = await worker_client.get_me()
-    log.info("Бот @%s запущен; рабочий аккаунт: %s", me.username, worker.id)
+    worker_id = worker.id if worker else "не подключён"
+    log.info("Бот @%s запущен; рабочий аккаунт: %s", me.username, worker_id)
     try:
         await bot_client.run_until_disconnected()
     finally:
-        await worker_client.disconnect()
+        if worker_client.is_connected():
+            await worker_client.disconnect()
 
 
 if __name__ == "__main__":
