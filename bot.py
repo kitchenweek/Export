@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 import asyncio
 import base64
 import hashlib
@@ -35,6 +34,7 @@ MAX_DELAY = 3.0
 MAX_REPORT_PART = 3900
 CHANNELS_PER_PAGE = 8
 QR_TIMEOUT = 180
+TEXT_MESSAGE_LIMIT = 4096
 
 logging.basicConfig(
     level=logging.INFO,
@@ -259,7 +259,7 @@ async def qr_login_flow(user_id: int):
                 caption=(
                     "\u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 Telegram \u2192 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u2192 \u0423\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u0430 \u2192 "
                     "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e \u0438 \u043e\u0442\u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0439\u0442\u0435 QR-\u043a\u043e\u0434.\n\n"
-                    f"ÐÐ¾Ð´ Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ {QR_TIMEOUT // 60} Ð¼Ð¸Ð½ÑÑÑ. "
+                    f"\u041a\u043e\u0434 \u0434\u0435\u0439\u0441\u0442\u0432\u0443\u0435\u0442 {QR_TIMEOUT // 60} \u043c\u0438\u043d\u0443\u0442\u044b. "
                     "\u041d\u0435 \u043f\u0435\u0440\u0435\u0441\u044b\u043b\u0430\u0439\u0442\u0435 \u044d\u0442\u043e \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u0434\u0440\u0443\u0433\u0438\u043c \u043b\u044e\u0434\u044f\u043c."
                 ),
                 buttons=[
@@ -287,7 +287,7 @@ async def qr_login_flow(user_id: int):
         ) or account.username or str(account.id)
         await bot_client.send_message(
             user_id,
-            f"ÐÐºÐºÐ°ÑÐ½Ñ Ð¿Ð¾Ð´ÐºÐ»ÑÑÑÐ½: {name}",
+            f"\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d: {name}",
             buttons=main_menu(),
             parse_mode=None,
         )
@@ -318,7 +318,7 @@ async def qr_login_flow(user_id: int):
         log.exception("\u041e\u0448\u0438\u0431\u043a\u0430 QR-\u0432\u0445\u043e\u0434\u0430 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f %s", user_id)
         await bot_client.send_message(
             user_id,
-            f"ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ: {type(error).__name__}: {error}",
+            f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442: {type(error).__name__}: {error}",
             buttons=main_menu(),
             parse_mode=None,
         )
@@ -398,6 +398,49 @@ def nearest_unused(source: Post, targets: list[Post], used: set[int]) -> Optiona
     )
 
 
+def is_text_target(post: Post) -> bool:
+    media = post.message.media
+    return not media or isinstance(
+        media,
+        (types.MessageMediaWebPage, types.MessageMediaEmpty),
+    )
+
+
+def nearest_unused_text_target(
+    source: Post,
+    targets: list[Post],
+    used: set[int],
+) -> Optional[Post]:
+    available = [
+        item
+        for item in targets
+        if item.message.id not in used and is_text_target(item)
+    ]
+    if not available:
+        return None
+    source_day = source.date.date()
+    return min(
+        available,
+        key=lambda item: (
+            abs((item.date.date() - source_day).days),
+            abs((item.date - source.date).total_seconds()),
+            item.message.id,
+        ),
+    )
+
+
+def is_caption_limit_error(error: Exception) -> bool:
+    value = f"{type(error).__name__}: {error}".lower().replace("_", "")
+    markers = (
+        "mediacaptiontoolong",
+        "captiontoolong",
+        "messagetoolong",
+        "caption is too long",
+        "message was too long",
+    )
+    return any(marker in value for marker in markers)
+
+
 async def edit_with_flood_retry(client, target_entity, target, source, file):
     kwargs = {
         "entity": target_entity,
@@ -414,21 +457,28 @@ async def edit_with_flood_retry(client, target_entity, target, source, file):
         await client.edit_message(**kwargs)
 
 
-async def replace_post(client, target_entity, target, source, temp_dir: Path):
+async def replace_post(
+    client,
+    target_entity,
+    target,
+    source,
+    temp_dir: Path,
+    text_only: bool = False,
+):
     media_file = None
     downloaded_path: Optional[Path] = None
-    if has_transferable_media(source.message):
+    if not text_only and has_transferable_media(source.message):
         downloaded = await client.download_media(source.message, file=str(temp_dir))
         if not downloaded:
             raise RuntimeError("\u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u0430\u0447\u0430\u0442\u044c \u043c\u0435\u0434\u0438\u0430 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0433\u043e \u043f\u043e\u0441\u0442\u0430")
         downloaded_path = Path(downloaded)
         media_file = str(downloaded_path)
-    elif source.message.media and not isinstance(
+    elif not text_only and source.message.media and not isinstance(
         source.message.media,
         (types.MessageMediaWebPage, types.MessageMediaEmpty),
     ):
         raise RuntimeError(
-            f"ÑÐ¸Ð¿ Ð¼ÐµÐ´Ð¸Ð° {type(source.message.media).__name__} Ð½ÐµÐ»ÑÐ·Ñ Ð¿ÐµÑÐµÐ½ÐµÑÑÐ¸ ÑÐµÐ´Ð°ÐºÑÐ¸ÑÐ¾Ð²Ð°Ð½Ð¸ÐµÐ¼"
+            f"\u0442\u0438\u043f \u043c\u0435\u0434\u0438\u0430 {type(source.message.media).__name__} \u043d\u0435\u043b\u044c\u0437\u044f \u043f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435\u043c"
         )
     elif has_transferable_media(target.message):
         media_file = types.InputMediaEmpty()
@@ -450,8 +500,8 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
     )
     if progress_callback:
         await progress_callback(
-            f"ÐÐ°Ð¹Ð´ÐµÐ½Ð¾ Ð¿Ð¾ÑÑÐ¾Ð²: Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð» â {len(source_posts)}, "
-            f"Ð²ÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð» â {len(target_posts)}. ÐÐ°ÑÐ¸Ð½Ð°Ñ Ð·Ð°Ð¼ÐµÐ½Ñ."
+            f"\u041d\u0430\u0439\u0434\u0435\u043d\u043e \u043f\u043e\u0441\u0442\u043e\u0432: \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u2014 {len(source_posts)}, "
+            f"\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u2014 {len(target_posts)}. \u041d\u0430\u0447\u0438\u043d\u0430\u044e \u0437\u0430\u043c\u0435\u043d\u0443."
         )
 
     issues: list[SyncIssue] = []
@@ -482,6 +532,46 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
                         )
                     )
             except Exception as error:
+                can_retry_as_text = (
+                    bool(source.message.photo)
+                    and len(source.text) <= TEXT_MESSAGE_LIMIT
+                    and is_caption_limit_error(error)
+                )
+                if can_retry_as_text:
+                    used_targets.discard(target.message.id)
+                    fallback = nearest_unused_text_target(
+                        source,
+                        target_posts,
+                        used_targets,
+                    )
+                    if fallback:
+                        used_targets.add(fallback.message.id)
+                        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                        try:
+                            await replace_post(
+                                client,
+                                target_entity,
+                                fallback,
+                                source,
+                                temp_dir,
+                                text_only=True,
+                            )
+                            changed += 1
+                            issues.append(
+                                SyncIssue(
+                                    "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415",
+                                    source.link,
+                                    fallback.link,
+                                    "\u043f\u043e\u0434\u043f\u0438\u0441\u044c \u043a \u0444\u043e\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u0438 \u043f\u0440\u0435\u0432\u044b\u0441\u0438\u043b\u0430 \u043b\u0438\u043c\u0438\u0442; "
+                                    "\u0442\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0435\u043d\u0435\u0441\u0451\u043d \u0432 \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0438\u0439 \u043f\u043e\u0441\u0442 \u0431\u0435\u0437 \u043c\u0435\u0434\u0438\u0430, "
+                                    "\u0444\u043e\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u044f \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u0430",
+                                )
+                            )
+                            continue
+                        except Exception as fallback_error:
+                            used_targets.discard(fallback.message.id)
+                            error = fallback_error
+                            target = fallback
                 log.exception("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c %s -> %s", source.link, target.link)
                 issues.append(
                     SyncIssue(
@@ -491,7 +581,7 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
                 )
             if progress_callback and number % 50 == 0:
                 await progress_callback(
-                    f"ÐÐ±ÑÐ°Ð±Ð¾ÑÐ°Ð½Ð¾ {number}/{len(source_posts)}, Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¾ {changed}."
+                    f"\u041e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e {number}/{len(source_posts)}, \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u043e {changed}."
                 )
     return changed, len(source_posts), issues
 
@@ -501,9 +591,9 @@ def build_report(changed: int, total: int, issues: list[SyncIssue]) -> str:
     warnings = sum(item.kind == "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415" for item in issues)
     lines = [
         "\u0421\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u044f \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.",
-        f"Ð£ÑÐ¿ÐµÑÐ½Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¾: {changed}/{total}",
-        f"ÐÑÐ¸Ð±Ð¾Ðº: {errors}",
-        f"ÐÑÐµÐ´ÑÐ¿ÑÐµÐ¶Ð´ÐµÐ½Ð¸Ð¹: {warnings}",
+        f"\u0423\u0441\u043f\u0435\u0448\u043d\u043e \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u043e: {changed}/{total}",
+        f"\u041e\u0448\u0438\u0431\u043e\u043a: {errors}",
+        f"\u041f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0435\u043d\u0438\u0439: {warnings}",
     ]
     if issues:
         lines.append("\n\u0421\u043f\u0438\u0441\u043e\u043a \u043e\u0448\u0438\u0431\u043e\u043a \u0438 \u043f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0435\u043d\u0438\u0439:")
@@ -511,8 +601,8 @@ def build_report(changed: int, total: int, issues: list[SyncIssue]) -> str:
             lines.extend(
                 [
                     f"\n{index}. {item.kind}: {item.details}",
-                    f"ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {item.source_link}",
-                    f"ÐÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {item.target_link}",
+                    f"\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b: {item.source_link}",
+                    f"\u0412\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b: {item.target_link}",
                 ]
             )
     return "\n".join(lines)
@@ -578,7 +668,7 @@ def channel_page(state: ChannelSelection, page: int):
     buttons.append(navigation)
     buttons.append([Button.inline("\u274c \u041e\u0442\u043c\u0435\u043d\u0430", b"sync:cancel")])
     action = "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b" if state.phase == "source" else "\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
-    return f"ÐÑÐ±ÐµÑÐ¸ÑÐµ {action}:\nâï¸ â Ð¼Ð¾Ð¶Ð½Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÑÑÑ, ð â ÑÐ¾Ð»ÑÐºÐ¾ ÑÑÐµÐ½Ð¸Ðµ", buttons
+    return f"\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 {action}:\n\u270f\ufe0f \u2014 \u043c\u043e\u0436\u043d\u043e \u0438\u0437\u043c\u0435\u043d\u044f\u0442\u044c, \U0001f441 \u2014 \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0442\u0435\u043d\u0438\u0435", buttons
 
 
 async def show_channel_page(event, state: ChannelSelection, page: int = 0, edit=False):
@@ -605,7 +695,7 @@ async def start_channel_selection(event, user_id: int):
         channels = await available_channels(client)
     except Exception as error:
         await event.respond(
-            f"ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð·Ð°Ð³ÑÑÐ·Ð¸ÑÑ ÐºÐ°Ð½Ð°Ð»Ñ: {type(error).__name__}: {error}",
+            f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u043a\u0430\u043d\u0430\u043b\u044b: {type(error).__name__}: {error}",
             parse_mode=None,
         )
         return
@@ -628,8 +718,8 @@ async def execute_sync(event, user_id: int, source, target):
             await event.respond("\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u044c\u043d\u0430.", parse_mode=None)
             return
         await event.respond(
-            f"ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {source.title}\n"
-            f"ÐÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {target.title}\n"
+            f"\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b: {source.title}\n"
+            f"\u0412\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b: {target.title}\n"
             "\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e \u043f\u043e\u0441\u0442\u044b\u2026",
             parse_mode=None,
         )
@@ -642,7 +732,7 @@ async def execute_sync(event, user_id: int, source, target):
             report = build_report(changed, total, issues)
         except Exception as error:
             log.exception("\u041a\u0440\u0438\u0442\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430 \u0441\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u0438 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f %s", user_id)
-            report = f"Ð¡Ð¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ð°:\n{type(error).__name__}: {error}"
+            report = f"\u0421\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u044f \u043e\u0441\u0442\u0430\u043d\u043e\u0432\u043b\u0435\u043d\u0430:\n{type(error).__name__}: {error}"
         for part in split_report(report):
             await event.respond(part, link_preview=False, parse_mode=None)
         await show_menu(event)
@@ -695,7 +785,7 @@ async def show_account_handler(event):
         )
         return
     await event.respond(
-        f"ÐÐ¾Ð´ÐºÐ»ÑÑÑÐ½ Ð°ÐºÐºÐ°ÑÐ½Ñ: {row['account_name']}\n"
+        f"\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d \u0430\u043a\u043a\u0430\u0443\u043d\u0442: {row['account_name']}\n"
         f"Telegram ID: {row['telegram_account_id']}",
         buttons=main_menu(), parse_mode=None,
     )
@@ -738,7 +828,7 @@ async def remove_account_handler(event):
         except Exception as error:
             await client.disconnect()
             await event.respond(
-                f"ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¾ÑÐ¾Ð·Ð²Ð°ÑÑ ÑÐµÑÑÐ¸Ñ: {type(error).__name__}: {error}",
+                f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u043e\u0442\u043e\u0437\u0432\u0430\u0442\u044c \u0441\u0435\u0441\u0441\u0438\u044e: {type(error).__name__}: {error}",
                 buttons=main_menu(),
                 parse_mode=None,
             )
@@ -795,7 +885,7 @@ async def channel_pick_handler(event):
         await show_menu(event, "\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d. \u041d\u0430\u0447\u043d\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e.")
         return
     await event.edit(
-        f"ÐÑÐ±ÑÐ°Ð½Ð¾:\n{source.title} â {channel.title}\n\nÐÐ°ÑÐ¸Ð½Ð°Ñ Ð¿ÐµÑÐµÐ½Ð¾Ñâ¦",
+        f"\u0412\u044b\u0431\u0440\u0430\u043d\u043e:\n{source.title} \u2192 {channel.title}\n\n\u041d\u0430\u0447\u0438\u043d\u0430\u044e \u043f\u0435\u0440\u0435\u043d\u043e\u0441\u2026",
         buttons=None, parse_mode=None,
     )
     await execute_sync(event, user_id, source, channel)
