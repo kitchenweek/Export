@@ -220,6 +220,7 @@ def main_menu():
     return [
         [Button.inline("\u2795 \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:add")],
         [Button.inline("\U0001f504 \u041f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u043f\u043e\u0441\u0442\u044b", b"sync:start")],
+        [Button.inline("\U0001f9f9 \u0417\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u043f\u043e\u0441\u0442\u044b \u043d\u0430 \u00ab.\u00bb", b"wipe:start")],
         [
             Button.inline("\U0001f464 \u041c\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:show"),
             Button.inline("\u2699\ufe0f \u041f\u043e\u043c\u043e\u0449\u044c", b"help"),
@@ -643,10 +644,15 @@ async def available_channels(client) -> dict[int, types.Channel]:
 
 def channel_page(state: ChannelSelection, page: int):
     channels = list(state.channels.values())
-    if state.phase == "target":
+    if state.phase in ("target", "wipe"):
         channels = [
             item for item in channels
-            if can_edit_channel(item) and (not state.source or item.id != state.source.id)
+            if can_edit_channel(item)
+            and (
+                state.phase != "target"
+                or not state.source
+                or item.id != state.source.id
+            )
         ]
     total_pages = max(1, (len(channels) + CHANNELS_PER_PAGE - 1) // CHANNELS_PER_PAGE)
     page = max(0, min(page, total_pages - 1))
@@ -667,7 +673,12 @@ def channel_page(state: ChannelSelection, page: int):
         navigation.append(Button.inline("\u27a1\ufe0f", f"page:{state.phase}:{page + 1}".encode()))
     buttons.append(navigation)
     buttons.append([Button.inline("\u274c \u041e\u0442\u043c\u0435\u043d\u0430", b"sync:cancel")])
-    action = "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b" if state.phase == "source" else "\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
+    if state.phase == "source":
+        action = "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
+    elif state.phase == "wipe":
+        action = "\u043a\u0430\u043d\u0430\u043b \u0434\u043b\u044f \u0437\u0430\u043c\u0435\u043d\u044b \u0432\u0441\u0435\u0445 \u043f\u043e\u0441\u0442\u043e\u0432 \u043d\u0430 \u00ab.\u00bb"
+    else:
+        action = "\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
     return f"\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 {action}:\n\u270f\ufe0f \u2014 \u043c\u043e\u0436\u043d\u043e \u0438\u0437\u043c\u0435\u043d\u044f\u0442\u044c, \U0001f441 \u2014 \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0442\u0435\u043d\u0438\u0435", buttons
 
 
@@ -708,6 +719,104 @@ async def start_channel_selection(event, user_id: int):
     state = ChannelSelection(channels=channels)
     selections[user_id] = state
     await show_channel_page(event, state)
+
+
+async def start_wipe_selection(event, user_id: int):
+    client = await get_user_client(user_id)
+    if not client:
+        await event.respond(
+            "\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 Telegram-\u0430\u043a\u043a\u0430\u0443\u043d\u0442.",
+            buttons=[[Button.inline("\u2795 \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c", b"account:add")]],
+            parse_mode=None,
+        )
+        return
+    if get_lock(sync_locks, user_id).locked():
+        await event.respond(
+            "\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442\u0441\u044f \u0434\u0440\u0443\u0433\u0430\u044f \u043e\u043f\u0435\u0440\u0430\u0446\u0438\u044f.",
+            parse_mode=None,
+        )
+        return
+    try:
+        channels = await available_channels(client)
+    except Exception as error:
+        await event.respond(
+            f"\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u0433\u0440\u0443\u0437\u0438\u0442\u044c \u043a\u0430\u043d\u0430\u043b\u044b: {type(error).__name__}: {error}",
+            parse_mode=None,
+        )
+        return
+    if not any(can_edit_channel(channel) for channel in channels.values()):
+        await event.respond(
+            "\u041d\u0435\u0442 \u043a\u0430\u043d\u0430\u043b\u043e\u0432, \u0432 \u043a\u043e\u0442\u043e\u0440\u044b\u0445 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u043c\u043e\u0436\u0435\u0442 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u043e\u0441\u0442\u044b.",
+            parse_mode=None,
+        )
+        return
+    state = ChannelSelection(channels=channels, phase="wipe")
+    selections[user_id] = state
+    await show_channel_page(event, state)
+
+
+async def edit_dot_with_retry(client, entity, message):
+    try:
+        await client.edit_message(entity, message.id, ".")
+    except FloodWaitError as error:
+        await asyncio.sleep(error.seconds + 1)
+        await client.edit_message(entity, message.id, ".")
+
+
+async def wipe_channel(event, user_id: int, channel):
+    lock = get_lock(sync_locks, user_id)
+    async with lock:
+        client = await get_user_client(user_id)
+        if not client:
+            await event.respond(
+                "\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u044c\u043d\u0430.",
+                parse_mode=None,
+            )
+            return
+        entity = await client.get_entity(channel)
+        changed = 0
+        skipped = 0
+        processed = 0
+        errors = []
+        async for message in client.iter_messages(entity, reverse=True):
+            if not is_real_post(message):
+                continue
+            processed += 1
+            if (message.message or "") == ".":
+                skipped += 1
+                continue
+            await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+            try:
+                await edit_dot_with_retry(client, entity, message)
+                changed += 1
+            except Exception as error:
+                errors.append(
+                    (
+                        message_link(entity, message.id),
+                        f"{type(error).__name__}: {error}",
+                    )
+                )
+            if processed % 50 == 0:
+                await event.respond(
+                    f"\u041e\u0431\u0440\u0430\u0431\u043e\u0442\u0430\u043d\u043e: {processed}, \u0438\u0437\u043c\u0435\u043d\u0435\u043d\u043e: {changed}.",
+                    parse_mode=None,
+                )
+        lines = [
+            "\u0417\u0430\u043c\u0435\u043d\u0430 \u043f\u043e\u0441\u0442\u043e\u0432 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.",
+            f"\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u043e: {changed}",
+            f"\u0423\u0436\u0435 \u0431\u044b\u043b\u043e \u00ab.\u00bb: {skipped}",
+            f"\u041e\u0448\u0438\u0431\u043e\u043a: {len(errors)}",
+        ]
+        for index, (link, details) in enumerate(errors, start=1):
+            lines.extend(
+                [
+                    f"\n{index}. {details}",
+                    f"\u041f\u043e\u0441\u0442: {link}",
+                ]
+            )
+        for part in split_report("\n".join(lines)):
+            await event.respond(part, parse_mode=None, link_preview=False)
+        await show_menu(event)
 
 
 async def execute_sync(event, user_id: int, source, target):
@@ -844,7 +953,13 @@ async def sync_button_handler(event):
     await start_channel_selection(event, event.sender_id)
 
 
-@bot_client.on(events.CallbackQuery(pattern=rb"page:(source|target):(\d+)"))
+@bot_client.on(events.CallbackQuery(data=b"wipe:start"))
+async def wipe_button_handler(event):
+    await event.answer()
+    await start_wipe_selection(event, event.sender_id)
+
+
+@bot_client.on(events.CallbackQuery(pattern=rb"page:(source|target|wipe):(\d+)"))
 async def channel_page_handler(event):
     await event.answer()
     state = selections.get(event.sender_id)
@@ -858,7 +973,7 @@ async def channel_page_handler(event):
     await show_channel_page(event, state, int(page), edit=True)
 
 
-@bot_client.on(events.CallbackQuery(pattern=rb"pick:(source|target):(\d+)"))
+@bot_client.on(events.CallbackQuery(pattern=rb"pick:(source|target|wipe):(\d+)"))
 async def channel_pick_handler(event):
     await event.answer()
     user_id = event.sender_id
@@ -879,6 +994,24 @@ async def channel_pick_handler(event):
         state.phase = "target"
         await show_channel_page(event, state, 0, edit=True)
         return
+    if phase == "wipe":
+        state.source = channel
+        state.phase = "wipe_confirm"
+        await event.edit(
+            f"\u041a\u0430\u043d\u0430\u043b: {channel.title}\n\n"
+            "\u0412\u0441\u0435 \u0442\u0435\u043a\u0441\u0442\u044b \u0438 \u043f\u043e\u0434\u043f\u0438\u0441\u0438 \u043f\u043e\u0441\u0442\u043e\u0432 \u0431\u0443\u0434\u0443\u0442 \u0437\u0430\u043c\u0435\u043d\u0435\u043d\u044b \u043d\u0430 \u00ab.\u00bb. "
+            "\u041c\u0435\u0434\u0438\u0430 \u043e\u0441\u0442\u0430\u043d\u0443\u0442\u0441\u044f. \u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043e\u0431\u0440\u0430\u0442\u0438\u043c\u043e.\n\n"
+            "\u041f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c?",
+            buttons=[
+                [Button.inline(
+                    "\u0414\u0430, \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u043f\u043e\u0441\u0442\u044b",
+                    f"wipe:confirm:{channel.id}".encode(),
+                )],
+                [Button.inline("\u274c \u041e\u0442\u043c\u0435\u043d\u0430", b"sync:cancel")],
+            ],
+            parse_mode=None,
+        )
+        return
     source = state.source
     selections.pop(user_id, None)
     if not source:
@@ -889,6 +1022,31 @@ async def channel_pick_handler(event):
         buttons=None, parse_mode=None,
     )
     await execute_sync(event, user_id, source, channel)
+
+
+@bot_client.on(events.CallbackQuery(pattern=rb"wipe:confirm:(\d+)"))
+async def wipe_confirm_handler(event):
+    await event.answer()
+    user_id = event.sender_id
+    state = selections.get(user_id)
+    if not state or state.phase != "wipe_confirm" or not state.source:
+        await show_menu(
+            event,
+            "\u0412\u044b\u0431\u043e\u0440 \u0443\u0441\u0442\u0430\u0440\u0435\u043b. \u041d\u0430\u0447\u043d\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e.",
+        )
+        return
+    channel_id = int(event.data.decode().rsplit(":", 1)[1])
+    if state.source.id != channel_id:
+        await event.answer("\u041a\u0430\u043d\u0430\u043b \u043d\u0435 \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0435\u0442", alert=True)
+        return
+    channel = state.source
+    selections.pop(user_id, None)
+    await event.edit(
+        f"\u041a\u0430\u043d\u0430\u043b: {channel.title}\n\n\u041d\u0430\u0447\u0438\u043d\u0430\u044e \u0437\u0430\u043c\u0435\u043d\u0443 \u043f\u043e\u0441\u0442\u043e\u0432\u2026",
+        buttons=None,
+        parse_mode=None,
+    )
+    await wipe_channel(event, user_id, channel)
 
 
 @bot_client.on(events.CallbackQuery(data=b"sync:cancel"))
