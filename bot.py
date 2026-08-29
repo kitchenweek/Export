@@ -1,16 +1,17 @@
+# -*- coding: utf-8 -*-
 import asyncio
 import base64
 import hashlib
 import logging
 import os
 import random
+import sqlite3
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-import asyncpg
 import qrcode
 from cryptography.fernet import Fernet, InvalidToken
 from telethon import Button, TelegramClient, events, types
@@ -25,8 +26,9 @@ BOT_TOKEN = os.getenv(
     "BOT_TOKEN",
     "8797332751:AAE_WMFhyYtNXrhyIq-xCky50Dzynlz3Xco",
 )
-DATABASE_URL = os.getenv("DATABASE_URL", "")
 SESSION_ENCRYPTION_KEY = os.getenv("SESSION_ENCRYPTION_KEY", "")
+DATA_DIR = Path(os.getenv("DATA_DIR", "."))
+SQLITE_PATH = DATA_DIR / "channel_sync.sqlite3"
 
 MIN_DELAY = 1.0
 MAX_DELAY = 3.0
@@ -76,8 +78,9 @@ class ChannelSelection:
 
 
 bot_client = TelegramClient("channel_sync_bot", API_ID, API_HASH)
-database: Optional[asyncpg.Pool] = None
+database: Optional[sqlite3.Connection] = None
 fernet: Optional[Fernet] = None
+database_lock = asyncio.Lock()
 user_clients: dict[int, TelegramClient] = {}
 client_locks: dict[int, asyncio.Lock] = {}
 sync_locks: dict[int, asyncio.Lock] = {}
@@ -102,87 +105,87 @@ def build_fernet() -> Fernet:
 async def init_database():
     global database, fernet
     fernet = build_fernet()
-    if not DATABASE_URL:
-        log.error("DATABASE_URL Ð½Ðµ Ð·Ð°Ð´Ð°Ð½")
-        return
-    try:
-        database = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
-        async with database.acquire() as connection:
-            await connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS telegram_user_sessions (
-                    bot_user_id BIGINT PRIMARY KEY,
-                    encrypted_session BYTEA NOT NULL,
-                    telegram_account_id BIGINT,
-                    account_name TEXT,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-                )
-                """
-            )
-    except Exception:
-        database = None
-        log.exception("ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÑÑÑ Ðº PostgreSQL")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(SQLITE_PATH, check_same_thread=False)
+    database.row_factory = sqlite3.Row
+    database.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telegram_user_sessions (
+            bot_user_id INTEGER PRIMARY KEY,
+            encrypted_session BLOB NOT NULL,
+            telegram_account_id INTEGER,
+            account_name TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    database.commit()
+    log.info("SQLite: %s", SQLITE_PATH)
 
 
 async def save_session(user_id: int, session: str, account) -> None:
     if not database or not fernet:
-        raise RuntimeError("PostgreSQL Ð½Ðµ Ð¿Ð¾Ð´ÐºÐ»ÑÑÑÐ½")
+        raise RuntimeError("SQLite \u043d\u0435 \u0438\u043d\u0438\u0446\u0438\u0430\u043b\u0438\u0437\u0438\u0440\u043e\u0432\u0430\u043d")
     encrypted = fernet.encrypt(session.encode("utf-8"))
     account_name = " ".join(
         part for part in (account.first_name, account.last_name) if part
     ) or account.username or str(account.id)
-    await database.execute(
-        """
-        INSERT INTO telegram_user_sessions (
-            bot_user_id, encrypted_session, telegram_account_id, account_name, updated_at
-        ) VALUES ($1, $2, $3, $4, NOW())
-        ON CONFLICT (bot_user_id) DO UPDATE SET
-            encrypted_session = EXCLUDED.encrypted_session,
-            telegram_account_id = EXCLUDED.telegram_account_id,
-            account_name = EXCLUDED.account_name,
-            updated_at = NOW()
-        """,
-        user_id,
-        encrypted,
-        account.id,
-        account_name,
-    )
+    async with database_lock:
+        database.execute(
+            """
+            INSERT INTO telegram_user_sessions (
+                bot_user_id, encrypted_session, telegram_account_id, account_name, updated_at
+            ) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT (bot_user_id) DO UPDATE SET
+                encrypted_session = excluded.encrypted_session,
+                telegram_account_id = excluded.telegram_account_id,
+                account_name = excluded.account_name,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (user_id, encrypted, account.id, account_name),
+        )
+        database.commit()
 
 
 async def load_session(user_id: int) -> Optional[str]:
     if not database or not fernet:
         return None
-    encrypted = await database.fetchval(
-        "SELECT encrypted_session FROM telegram_user_sessions WHERE bot_user_id = $1",
-        user_id,
-    )
+    async with database_lock:
+        row = database.execute(
+            "SELECT encrypted_session FROM telegram_user_sessions WHERE bot_user_id = ?",
+            (user_id,),
+        ).fetchone()
+    encrypted = row["encrypted_session"] if row else None
     if not encrypted:
         return None
     try:
         return fernet.decrypt(bytes(encrypted)).decode("utf-8")
     except InvalidToken:
-        log.error("ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÐ°ÑÑÐ¸ÑÑÐ¾Ð²Ð°ÑÑ ÑÐµÑÑÐ¸Ñ Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»Ñ %s", user_id)
+        log.error("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0440\u0430\u0441\u0448\u0438\u0444\u0440\u043e\u0432\u0430\u0442\u044c \u0441\u0435\u0441\u0441\u0438\u044e \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f %s", user_id)
         return None
 
 
 async def delete_session(user_id: int) -> None:
     if database:
-        await database.execute(
-            "DELETE FROM telegram_user_sessions WHERE bot_user_id = $1",
-            user_id,
-        )
+        async with database_lock:
+            database.execute(
+                "DELETE FROM telegram_user_sessions WHERE bot_user_id = ?",
+                (user_id,),
+            )
+            database.commit()
 
 
 async def stored_account(user_id: int):
     if not database:
         return None
-    return await database.fetchrow(
-        """
-        SELECT telegram_account_id, account_name, updated_at
-        FROM telegram_user_sessions WHERE bot_user_id = $1
-        """,
-        user_id,
-    )
+    async with database_lock:
+        return database.execute(
+            """
+            SELECT telegram_account_id, account_name, updated_at
+            FROM telegram_user_sessions WHERE bot_user_id = ?
+            """,
+            (user_id,),
+        ).fetchone()
 
 
 async def get_user_client(user_id: int) -> Optional[TelegramClient]:
@@ -215,17 +218,17 @@ async def get_user_client(user_id: int) -> Optional[TelegramClient]:
 
 def main_menu():
     return [
-        [Button.inline("â ÐÐ¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ", b"account:add")],
-        [Button.inline("ð ÐÐµÑÐµÐ½ÐµÑÑÐ¸ Ð¿Ð¾ÑÑÑ", b"sync:start")],
+        [Button.inline("\u2795 \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:add")],
+        [Button.inline("\U0001f504 \u041f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u043f\u043e\u0441\u0442\u044b", b"sync:start")],
         [
-            Button.inline("ð¤ ÐÐ¾Ð¹ Ð°ÐºÐºÐ°ÑÐ½Ñ", b"account:show"),
-            Button.inline("âï¸ ÐÐ¾Ð¼Ð¾ÑÑ", b"help"),
+            Button.inline("\U0001f464 \u041c\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:show"),
+            Button.inline("\u2699\ufe0f \u041f\u043e\u043c\u043e\u0449\u044c", b"help"),
         ],
-        [Button.inline("ðª ÐÑÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ", b"account:remove")],
+        [Button.inline("\U0001f6aa \u041e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:remove")],
     ]
 
 
-async def show_menu(event, text: str = "ÐÑÐ±ÐµÑÐ¸ÑÐµ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ðµ:"):
+async def show_menu(event, text: str = "\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0435:"):
     await event.respond(text, buttons=main_menu(), parse_mode=None)
 
 
@@ -233,8 +236,8 @@ async def begin_qr_login(event, user_id: int):
     old_task = login_tasks.get(user_id)
     if old_task and not old_task.done():
         await event.respond(
-            "ÐÑÐ¾Ð´ ÑÐ¶Ðµ Ð·Ð°Ð¿ÑÑÐµÐ½. ÐÑÑÐºÐ°Ð½Ð¸ÑÑÐ¹ÑÐµ Ð¿Ð¾ÑÐ»ÐµÐ´Ð½Ð¸Ð¹ QR-ÐºÐ¾Ð´ Ð¸Ð»Ð¸ Ð½Ð°Ð¶Ð¼Ð¸ÑÐµ Â«ÐÑÐ¼ÐµÐ½Ð°Â».",
-            buttons=[[Button.inline("ÐÑÐ¼ÐµÐ½Ð°", b"login:cancel")]],
+            "\u0412\u0445\u043e\u0434 \u0443\u0436\u0435 \u0437\u0430\u043f\u0443\u0449\u0435\u043d. \u041e\u0442\u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0439\u0442\u0435 \u043f\u043e\u0441\u043b\u0435\u0434\u043d\u0438\u0439 QR-\u043a\u043e\u0434 \u0438\u043b\u0438 \u043d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041e\u0442\u043c\u0435\u043d\u0430\u00bb.",
+            buttons=[[Button.inline("\u041e\u0442\u043c\u0435\u043d\u0430", b"login:cancel")]],
             parse_mode=None,
         )
         return
@@ -254,14 +257,14 @@ async def qr_login_flow(user_id: int):
                 user_id,
                 str(qr_path),
                 caption=(
-                    "ÐÑÐºÑÐ¾Ð¹ÑÐµ Telegram â ÐÐ°ÑÑÑÐ¾Ð¹ÐºÐ¸ â Ð£ÑÑÑÐ¾Ð¹ÑÑÐ²Ð° â "
-                    "ÐÐ¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ ÑÑÑÑÐ¾Ð¹ÑÑÐ²Ð¾ Ð¸ Ð¾ÑÑÐºÐ°Ð½Ð¸ÑÑÐ¹ÑÐµ QR-ÐºÐ¾Ð´.\n\n"
+                    "\u041e\u0442\u043a\u0440\u043e\u0439\u0442\u0435 Telegram \u2192 \u041d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0438 \u2192 \u0423\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u0430 \u2192 "
+                    "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u043e \u0438 \u043e\u0442\u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0439\u0442\u0435 QR-\u043a\u043e\u0434.\n\n"
                     f"ÐÐ¾Ð´ Ð´ÐµÐ¹ÑÑÐ²ÑÐµÑ {QR_TIMEOUT // 60} Ð¼Ð¸Ð½ÑÑÑ. "
-                    "ÐÐµ Ð¿ÐµÑÐµÑÑÐ»Ð°Ð¹ÑÐµ ÑÑÐ¾ ÑÐ¾Ð¾Ð±ÑÐµÐ½Ð¸Ðµ Ð´ÑÑÐ³Ð¸Ð¼ Ð»ÑÐ´ÑÐ¼."
+                    "\u041d\u0435 \u043f\u0435\u0440\u0435\u0441\u044b\u043b\u0430\u0439\u0442\u0435 \u044d\u0442\u043e \u0441\u043e\u043e\u0431\u0449\u0435\u043d\u0438\u0435 \u0434\u0440\u0443\u0433\u0438\u043c \u043b\u044e\u0434\u044f\u043c."
                 ),
                 buttons=[
-                    [Button.url("ð± ÐÑÐºÑÑÑÑ Ð²ÑÐ¾Ð´ Ð½Ð° ÑÑÐ¾Ð¼ ÑÑÑÑÐ¾Ð¹ÑÑÐ²Ðµ", qr_login.url)],
-                    [Button.inline("ÐÑÐ¼ÐµÐ½Ð°", b"login:cancel")],
+                    [Button.url("\U0001f4f1 \u041e\u0442\u043a\u0440\u044b\u0442\u044c \u0432\u0445\u043e\u0434 \u043d\u0430 \u044d\u0442\u043e\u043c \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u0435", qr_login.url)],
+                    [Button.inline("\u041e\u0442\u043c\u0435\u043d\u0430", b"login:cancel")],
                 ],
             )
         await qr_login.wait(timeout=QR_TIMEOUT)
@@ -291,28 +294,28 @@ async def qr_login_flow(user_id: int):
     except SessionPasswordNeededError:
         await bot_client.send_message(
             user_id,
-            "ÐÐ° Ð°ÐºÐºÐ°ÑÐ½ÑÐµ Ð²ÐºÐ»ÑÑÑÐ½ Ð¾Ð±Ð»Ð°ÑÐ½ÑÐ¹ Ð¿Ð°ÑÐ¾Ð»Ñ Telegram. Ð ÑÐµÐ»ÑÑ Ð±ÐµÐ·Ð¾Ð¿Ð°ÑÐ½Ð¾ÑÑÐ¸ "
-            "Ð±Ð¾Ñ Ð½Ðµ Ð¿ÑÐ¾ÑÐ¸Ñ Ð¿ÑÐ¸ÑÑÐ»Ð°ÑÑ Ð¿Ð°ÑÐ¾Ð»Ñ Ð² ÑÐ°Ñ. ÐÐ»Ñ ÑÑÐ¾Ð³Ð¾ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð¿Ð¾Ð½Ð°Ð´Ð¾Ð±Ð¸ÑÑÑ "
-            "Ð»Ð¾ÐºÐ°Ð»ÑÐ½Ð¾Ðµ ÑÐ¾Ð·Ð´Ð°Ð½Ð¸Ðµ ÑÐµÑÑÐ¸Ð¸.",
+            "\u041d\u0430 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0435 \u0432\u043a\u043b\u044e\u0447\u0451\u043d \u043e\u0431\u043b\u0430\u0447\u043d\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c Telegram. \u0412 \u0446\u0435\u043b\u044f\u0445 \u0431\u0435\u0437\u043e\u043f\u0430\u0441\u043d\u043e\u0441\u0442\u0438 "
+            "\u0431\u043e\u0442 \u043d\u0435 \u043f\u0440\u043e\u0441\u0438\u0442 \u043f\u0440\u0438\u0441\u044b\u043b\u0430\u0442\u044c \u043f\u0430\u0440\u043e\u043b\u044c \u0432 \u0447\u0430\u0442. \u0414\u043b\u044f \u044d\u0442\u043e\u0433\u043e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043f\u043e\u043d\u0430\u0434\u043e\u0431\u0438\u0442\u0441\u044f "
+            "\u043b\u043e\u043a\u0430\u043b\u044c\u043d\u043e\u0435 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u0435 \u0441\u0435\u0441\u0441\u0438\u0438.",
             buttons=main_menu(),
             parse_mode=None,
         )
     except asyncio.TimeoutError:
         await bot_client.send_message(
             user_id,
-            "ÐÑÐµÐ¼Ñ QR-ÐºÐ¾Ð´Ð° Ð¸ÑÑÐµÐºÐ»Ð¾. ÐÐ°Ð¶Ð¼Ð¸ÑÐµ Â«ÐÐ¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½ÑÂ» Ð¸ Ð¿Ð¾Ð¿ÑÐ¾Ð±ÑÐ¹ÑÐµ ÑÐ½Ð¾Ð²Ð°.",
+            "\u0412\u0440\u0435\u043c\u044f QR-\u043a\u043e\u0434\u0430 \u0438\u0441\u0442\u0435\u043a\u043b\u043e. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u00bb \u0438 \u043f\u043e\u043f\u0440\u043e\u0431\u0443\u0439\u0442\u0435 \u0441\u043d\u043e\u0432\u0430.",
             buttons=main_menu(),
             parse_mode=None,
         )
     except asyncio.CancelledError:
         await bot_client.send_message(
             user_id,
-            "ÐÐ¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸Ðµ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð¾ÑÐ¼ÐµÐ½ÐµÐ½Ð¾.",
+            "\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435 \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043e\u0442\u043c\u0435\u043d\u0435\u043d\u043e.",
             buttons=main_menu(),
             parse_mode=None,
         )
     except Exception as error:
-        log.exception("ÐÑÐ¸Ð±ÐºÐ° QR-Ð²ÑÐ¾Ð´Ð° Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»Ñ %s", user_id)
+        log.exception("\u041e\u0448\u0438\u0431\u043a\u0430 QR-\u0432\u0445\u043e\u0434\u0430 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f %s", user_id)
         await bot_client.send_message(
             user_id,
             f"ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ: {type(error).__name__}: {error}",
@@ -331,7 +334,7 @@ def message_link(entity, message_id: int) -> str:
     if username:
         return f"https://t.me/{username}/{message_id}"
     channel_id = str(getattr(entity, "id", ""))
-    return f"https://t.me/c/{channel_id}/{message_id}" if channel_id else "ÑÑÑÐ»ÐºÐ° Ð½ÐµÐ´Ð¾ÑÑÑÐ¿Ð½Ð°"
+    return f"https://t.me/c/{channel_id}/{message_id}" if channel_id else "\u0441\u0441\u044b\u043b\u043a\u0430 \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430"
 
 
 def is_real_post(message: Message) -> bool:
@@ -417,7 +420,7 @@ async def replace_post(client, target_entity, target, source, temp_dir: Path):
     if has_transferable_media(source.message):
         downloaded = await client.download_media(source.message, file=str(temp_dir))
         if not downloaded:
-            raise RuntimeError("Ð½Ðµ ÑÐ´Ð°Ð»Ð¾ÑÑ ÑÐºÐ°ÑÐ°ÑÑ Ð¼ÐµÐ´Ð¸Ð° Ð¸ÑÑÐ¾Ð´Ð½Ð¾Ð³Ð¾ Ð¿Ð¾ÑÑÐ°")
+            raise RuntimeError("\u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u0430\u0447\u0430\u0442\u044c \u043c\u0435\u0434\u0438\u0430 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0433\u043e \u043f\u043e\u0441\u0442\u0430")
         downloaded_path = Path(downloaded)
         media_file = str(downloaded_path)
     elif source.message.media and not isinstance(
@@ -440,7 +443,7 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
     source_entity = await client.get_entity(source_channel)
     target_entity = await client.get_entity(target_channel)
     if source_entity.id == target_entity.id:
-        raise RuntimeError("Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ Ð¸ Ð²ÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð» Ð½Ðµ Ð´Ð¾Ð»Ð¶Ð½Ñ ÑÐ¾Ð²Ð¿Ð°Ð´Ð°ÑÑ")
+        raise RuntimeError("\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u0438 \u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u043d\u0435 \u0434\u043e\u043b\u0436\u043d\u044b \u0441\u043e\u0432\u043f\u0430\u0434\u0430\u0442\u044c")
     source_posts, target_posts = await asyncio.gather(
         load_posts(client, source_entity),
         load_posts(client, target_entity),
@@ -461,8 +464,8 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
             if target is None:
                 issues.append(
                     SyncIssue(
-                        "ÐÐ¨ÐÐÐÐ", source.link, "Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½",
-                        "Ð²Ð¾ Ð²ÑÐ¾ÑÐ¾Ð¼ ÐºÐ°Ð½Ð°Ð»Ðµ Ð·Ð°ÐºÐ¾Ð½ÑÐ¸Ð»Ð¸ÑÑ ÑÐ²Ð¾Ð±Ð¾Ð´Ð½ÑÐµ Ð¿Ð¾ÑÑÑ",
+                        "\u041e\u0428\u0418\u0411\u041a\u0410", source.link, "\u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d",
+                        "\u0432\u043e \u0432\u0442\u043e\u0440\u043e\u043c \u043a\u0430\u043d\u0430\u043b\u0435 \u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0438\u0441\u044c \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u044b\u0435 \u043f\u043e\u0441\u0442\u044b",
                     )
                 )
                 continue
@@ -474,15 +477,15 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
                 if target.album_size > 1:
                     issues.append(
                         SyncIssue(
-                            "ÐÐ ÐÐÐ£ÐÐ ÐÐÐÐÐÐÐ", source.link, target.link,
-                            "Ð¸Ð·Ð¼ÐµÐ½ÑÐ½ Ð¿ÐµÑÐ²ÑÐ¹ ÑÐ»ÐµÐ¼ÐµÐ½Ñ ÑÐµÐ»ÐµÐ²Ð¾Ð³Ð¾ Ð°Ð»ÑÐ±Ð¾Ð¼Ð°; Ð¾ÑÑÐ°Ð»ÑÐ½ÑÐµ Ð½Ðµ ÑÐ´Ð°Ð»ÑÐ»Ð¸ÑÑ",
+                            "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415", source.link, target.link,
+                            "\u0438\u0437\u043c\u0435\u043d\u0451\u043d \u043f\u0435\u0440\u0432\u044b\u0439 \u044d\u043b\u0435\u043c\u0435\u043d\u0442 \u0446\u0435\u043b\u0435\u0432\u043e\u0433\u043e \u0430\u043b\u044c\u0431\u043e\u043c\u0430; \u043e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u043d\u0435 \u0443\u0434\u0430\u043b\u044f\u043b\u0438\u0441\u044c",
                         )
                     )
             except Exception as error:
-                log.exception("ÐÐµ ÑÐ´Ð°Ð»Ð¾ÑÑ Ð·Ð°Ð¼ÐµÐ½Ð¸ÑÑ %s -> %s", source.link, target.link)
+                log.exception("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c %s -> %s", source.link, target.link)
                 issues.append(
                     SyncIssue(
-                        "ÐÐ¨ÐÐÐÐ", source.link, target.link,
+                        "\u041e\u0428\u0418\u0411\u041a\u0410", source.link, target.link,
                         f"{type(error).__name__}: {error}",
                     )
                 )
@@ -494,16 +497,16 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
 
 
 def build_report(changed: int, total: int, issues: list[SyncIssue]) -> str:
-    errors = sum(item.kind == "ÐÐ¨ÐÐÐÐ" for item in issues)
-    warnings = sum(item.kind == "ÐÐ ÐÐÐ£ÐÐ ÐÐÐÐÐÐÐ" for item in issues)
+    errors = sum(item.kind == "\u041e\u0428\u0418\u0411\u041a\u0410" for item in issues)
+    warnings = sum(item.kind == "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415" for item in issues)
     lines = [
-        "Ð¡Ð¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð°.",
+        "\u0421\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u044f \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.",
         f"Ð£ÑÐ¿ÐµÑÐ½Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÐµÐ½Ð¾: {changed}/{total}",
         f"ÐÑÐ¸Ð±Ð¾Ðº: {errors}",
         f"ÐÑÐµÐ´ÑÐ¿ÑÐµÐ¶Ð´ÐµÐ½Ð¸Ð¹: {warnings}",
     ]
     if issues:
-        lines.append("\nÐ¡Ð¿Ð¸ÑÐ¾Ðº Ð¾ÑÐ¸Ð±Ð¾Ðº Ð¸ Ð¿ÑÐµÐ´ÑÐ¿ÑÐµÐ¶Ð´ÐµÐ½Ð¸Ð¹:")
+        lines.append("\n\u0421\u043f\u0438\u0441\u043e\u043a \u043e\u0448\u0438\u0431\u043e\u043a \u0438 \u043f\u0440\u0435\u0434\u0443\u043f\u0440\u0435\u0436\u0434\u0435\u043d\u0438\u0439:")
         for index, item in enumerate(issues, start=1):
             lines.extend(
                 [
@@ -561,20 +564,20 @@ def channel_page(state: ChannelSelection, page: int):
     visible = channels[start : start + CHANNELS_PER_PAGE]
     buttons = []
     for channel in visible:
-        icon = "âï¸" if can_edit_channel(channel) else "ð"
-        title = (channel.title or "ÐÐµÐ· Ð½Ð°Ð·Ð²Ð°Ð½Ð¸Ñ")[:45]
+        icon = "\u270f\ufe0f" if can_edit_channel(channel) else "\U0001f441"
+        title = (channel.title or "\u0411\u0435\u0437 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u044f")[:45]
         buttons.append(
             [Button.inline(f"{icon} {title}", f"pick:{state.phase}:{channel.id}".encode())]
         )
     navigation = []
     if page > 0:
-        navigation.append(Button.inline("â¬ï¸", f"page:{state.phase}:{page - 1}".encode()))
+        navigation.append(Button.inline("\u2b05\ufe0f", f"page:{state.phase}:{page - 1}".encode()))
     navigation.append(Button.inline(f"{page + 1}/{total_pages}", b"noop"))
     if page + 1 < total_pages:
-        navigation.append(Button.inline("â¡ï¸", f"page:{state.phase}:{page + 1}".encode()))
+        navigation.append(Button.inline("\u27a1\ufe0f", f"page:{state.phase}:{page + 1}".encode()))
     buttons.append(navigation)
-    buttons.append([Button.inline("â ÐÑÐ¼ÐµÐ½Ð°", b"sync:cancel")])
-    action = "Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð»" if state.phase == "source" else "Ð²ÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð»"
+    buttons.append([Button.inline("\u274c \u041e\u0442\u043c\u0435\u043d\u0430", b"sync:cancel")])
+    action = "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b" if state.phase == "source" else "\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
     return f"ÐÑÐ±ÐµÑÐ¸ÑÐµ {action}:\nâï¸ â Ð¼Ð¾Ð¶Ð½Ð¾ Ð¸Ð·Ð¼ÐµÐ½ÑÑÑ, ð â ÑÐ¾Ð»ÑÐºÐ¾ ÑÑÐµÐ½Ð¸Ðµ", buttons
 
 
@@ -590,13 +593,13 @@ async def start_channel_selection(event, user_id: int):
     client = await get_user_client(user_id)
     if not client:
         await event.respond(
-            "Ð¡Ð½Ð°ÑÐ°Ð»Ð° Ð¿Ð¾Ð´ÐºÐ»ÑÑÐ¸ÑÐµ Telegram-Ð°ÐºÐºÐ°ÑÐ½Ñ.",
-            buttons=[[Button.inline("â ÐÐ¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ", b"account:add")]],
+            "\u0421\u043d\u0430\u0447\u0430\u043b\u0430 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u0435 Telegram-\u0430\u043a\u043a\u0430\u0443\u043d\u0442.",
+            buttons=[[Button.inline("\u2795 \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c", b"account:add")]],
             parse_mode=None,
         )
         return
     if get_lock(sync_locks, user_id).locked():
-        await event.respond("Ð£ Ð²Ð°Ñ ÑÐ¶Ðµ Ð²ÑÐ¿Ð¾Ð»Ð½ÑÐµÑÑÑ Ð¿ÐµÑÐµÐ½Ð¾Ñ.", parse_mode=None)
+        await event.respond("\u0423 \u0432\u0430\u0441 \u0443\u0436\u0435 \u0432\u044b\u043f\u043e\u043b\u043d\u044f\u0435\u0442\u0441\u044f \u043f\u0435\u0440\u0435\u043d\u043e\u0441.", parse_mode=None)
         return
     try:
         channels = await available_channels(client)
@@ -608,7 +611,7 @@ async def start_channel_selection(event, user_id: int):
         return
     if len(channels) < 2:
         await event.respond(
-            "Ð Ð¿Ð¾Ð´ÐºÐ»ÑÑÑÐ½Ð½Ð¾Ð¼ Ð°ÐºÐºÐ°ÑÐ½ÑÐµ Ð´Ð¾Ð»Ð¶Ð½Ð¾ Ð±ÑÑÑ Ð½Ðµ Ð¼ÐµÐ½ÐµÐµ Ð´Ð²ÑÑ ÐºÐ°Ð½Ð°Ð»Ð¾Ð².",
+            "\u0412 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d\u043d\u043e\u043c \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0435 \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043d\u0435 \u043c\u0435\u043d\u0435\u0435 \u0434\u0432\u0443\u0445 \u043a\u0430\u043d\u0430\u043b\u043e\u0432.",
             parse_mode=None,
         )
         return
@@ -622,12 +625,12 @@ async def execute_sync(event, user_id: int, source, target):
     async with lock:
         client = await get_user_client(user_id)
         if not client:
-            await event.respond("Ð¡ÐµÑÑÐ¸Ñ Ð°ÐºÐºÐ°ÑÐ½ÑÐ° Ð½ÐµÐ´ÐµÐ¹ÑÑÐ²Ð¸ÑÐµÐ»ÑÐ½Ð°.", parse_mode=None)
+            await event.respond("\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430 \u043d\u0435\u0434\u0435\u0439\u0441\u0442\u0432\u0438\u0442\u0435\u043b\u044c\u043d\u0430.", parse_mode=None)
             return
         await event.respond(
             f"ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {source.title}\n"
             f"ÐÑÐ¾ÑÐ¾Ð¹ ÐºÐ°Ð½Ð°Ð»: {target.title}\n"
-            "ÐÐ°Ð³ÑÑÐ¶Ð°Ñ Ð¿Ð¾ÑÑÑâ¦",
+            "\u0417\u0430\u0433\u0440\u0443\u0436\u0430\u044e \u043f\u043e\u0441\u0442\u044b\u2026",
             parse_mode=None,
         )
 
@@ -638,7 +641,7 @@ async def execute_sync(event, user_id: int, source, target):
             changed, total, issues = await run_sync(client, source, target, progress)
             report = build_report(changed, total, issues)
         except Exception as error:
-            log.exception("ÐÑÐ¸ÑÐ¸ÑÐµÑÐºÐ°Ñ Ð¾ÑÐ¸Ð±ÐºÐ° ÑÐ¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ð¸ Ð¿Ð¾Ð»ÑÐ·Ð¾Ð²Ð°ÑÐµÐ»Ñ %s", user_id)
+            log.exception("\u041a\u0440\u0438\u0442\u0438\u0447\u0435\u0441\u043a\u0430\u044f \u043e\u0448\u0438\u0431\u043a\u0430 \u0441\u0438\u043d\u0445\u0440\u043e\u043d\u0438\u0437\u0430\u0446\u0438\u0438 \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f %s", user_id)
             report = f"Ð¡Ð¸Ð½ÑÑÐ¾Ð½Ð¸Ð·Ð°ÑÐ¸Ñ Ð¾ÑÑÐ°Ð½Ð¾Ð²Ð»ÐµÐ½Ð°:\n{type(error).__name__}: {error}"
         for part in split_report(report):
             await event.respond(part, link_preview=False, parse_mode=None)
@@ -650,7 +653,7 @@ async def start_handler(event):
     if event.is_private:
         await show_menu(
             event,
-            "ÐÐ¾Ñ Ð¿ÐµÑÐµÐ½Ð¾ÑÐ¸Ñ ÑÐ¾Ð´ÐµÑÐ¶Ð¸Ð¼Ð¾Ðµ Ð¿Ð¾ÑÑÐ¾Ð² Ð¼ÐµÐ¶Ð´Ñ Ð²Ð°ÑÐ¸Ð¼Ð¸ ÐºÐ°Ð½Ð°Ð»Ð°Ð¼Ð¸ Ð¿Ð¾ Ð±Ð»Ð¸Ð¶Ð°Ð¹ÑÐ¸Ð¼ Ð´Ð°ÑÐ°Ð¼.",
+            "\u0411\u043e\u0442 \u043f\u0435\u0440\u0435\u043d\u043e\u0441\u0438\u0442 \u0441\u043e\u0434\u0435\u0440\u0436\u0438\u043c\u043e\u0435 \u043f\u043e\u0441\u0442\u043e\u0432 \u043c\u0435\u0436\u0434\u0443 \u0432\u0430\u0448\u0438\u043c\u0438 \u043a\u0430\u043d\u0430\u043b\u0430\u043c\u0438 \u043f\u043e \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0438\u043c \u0434\u0430\u0442\u0430\u043c.",
         )
 
 
@@ -665,13 +668,7 @@ async def add_account_handler(event):
     await event.answer()
     if get_lock(sync_locks, event.sender_id).locked():
         await event.respond(
-            "ÐÐ¾Ð¶Ð´Ð¸ÑÐµÑÑ Ð¾ÐºÐ¾Ð½ÑÐ°Ð½Ð¸Ñ ÑÐµÐºÑÑÐµÐ³Ð¾ Ð¿ÐµÑÐµÐ½Ð¾ÑÐ° Ð¿ÐµÑÐµÐ´ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸ÐµÐ¼ Ð´ÑÑÐ³Ð¾Ð³Ð¾ Ð°ÐºÐºÐ°ÑÐ½ÑÐ°.",
-            parse_mode=None,
-        )
-        return
-    if not database:
-        await event.respond(
-            "PostgreSQL Ð½Ðµ Ð¿Ð¾Ð´ÐºÐ»ÑÑÑÐ½. Ð£ÐºÐ°Ð¶Ð¸ÑÐµ DATABASE_URL Ð½Ð° ÑÐ¾ÑÑÐ¸Ð½Ð³Ðµ.",
+            "\u0414\u043e\u0436\u0434\u0438\u0442\u0435\u0441\u044c \u043e\u043a\u043e\u043d\u0447\u0430\u043d\u0438\u044f \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u0435\u0440\u0435\u043d\u043e\u0441\u0430 \u043f\u0435\u0440\u0435\u0434 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u0435\u043c \u0434\u0440\u0443\u0433\u043e\u0433\u043e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430.",
             parse_mode=None,
         )
         return
@@ -685,7 +682,7 @@ async def cancel_login_handler(event):
     if task and not task.done():
         task.cancel()
     else:
-        await show_menu(event, "ÐÐºÑÐ¸Ð²Ð½Ð¾Ð³Ð¾ Ð¿Ð¾Ð´ÐºÐ»ÑÑÐµÐ½Ð¸Ñ Ð½ÐµÑ.")
+        await show_menu(event, "\u0410\u043a\u0442\u0438\u0432\u043d\u043e\u0433\u043e \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0435\u043d\u0438\u044f \u043d\u0435\u0442.")
 
 
 @bot_client.on(events.CallbackQuery(data=b"account:show"))
@@ -694,7 +691,7 @@ async def show_account_handler(event):
     row = await stored_account(event.sender_id)
     if not row:
         await event.respond(
-            "Telegram-Ð°ÐºÐºÐ°ÑÐ½Ñ ÐµÑÑ Ð½Ðµ Ð¿Ð¾Ð´ÐºÐ»ÑÑÑÐ½.", buttons=main_menu(), parse_mode=None
+            "Telegram-\u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0435\u0449\u0451 \u043d\u0435 \u043f\u043e\u0434\u043a\u043b\u044e\u0447\u0451\u043d.", buttons=main_menu(), parse_mode=None
         )
         return
     await event.respond(
@@ -708,10 +705,10 @@ async def show_account_handler(event):
 async def remove_account_question(event):
     await event.answer()
     await event.respond(
-        "ÐÑÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ? Ð¢ÐµÐºÑÑÐ°Ñ ÑÐµÑÑÐ¸Ñ Ð±ÑÐ´ÐµÑ Ð¾ÑÐ¾Ð·Ð²Ð°Ð½Ð° Ð² Telegram.",
+        "\u041e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442? \u0422\u0435\u043a\u0443\u0449\u0430\u044f \u0441\u0435\u0441\u0441\u0438\u044f \u0431\u0443\u0434\u0435\u0442 \u043e\u0442\u043e\u0437\u0432\u0430\u043d\u0430 \u0432 Telegram.",
         buttons=[[
-            Button.inline("ÐÐ°, Ð¾ÑÐºÐ»ÑÑÐ¸ÑÑ", b"account:remove:yes"),
-            Button.inline("ÐÑÐ¼ÐµÐ½Ð°", b"menu"),
+            Button.inline("\u0414\u0430, \u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c", b"account:remove:yes"),
+            Button.inline("\u041e\u0442\u043c\u0435\u043d\u0430", b"menu"),
         ]],
         parse_mode=None,
     )
@@ -723,7 +720,7 @@ async def remove_account_handler(event):
     user_id = event.sender_id
     if get_lock(sync_locks, user_id).locked():
         await event.respond(
-            "ÐÐµÐ»ÑÐ·Ñ Ð¾ÑÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½Ñ Ð²Ð¾ Ð²ÑÐµÐ¼Ñ Ð¿ÐµÑÐµÐ½Ð¾ÑÐ°. ÐÐ¾Ð¶Ð´Ð¸ÑÐµÑÑ Ð·Ð°Ð²ÐµÑÑÐµÐ½Ð¸Ñ.",
+            "\u041d\u0435\u043b\u044c\u0437\u044f \u043e\u0442\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0432\u043e \u0432\u0440\u0435\u043c\u044f \u043f\u0435\u0440\u0435\u043d\u043e\u0441\u0430. \u0414\u043e\u0436\u0434\u0438\u0442\u0435\u0441\u044c \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0438\u044f.",
             buttons=main_menu(),
             parse_mode=None,
         )
@@ -748,7 +745,7 @@ async def remove_account_handler(event):
             return
     await delete_session(user_id)
     selections.pop(user_id, None)
-    await show_menu(event, "ÐÐºÐºÐ°ÑÐ½Ñ Ð¾ÑÐºÐ»ÑÑÑÐ½, ÑÐµÑÑÐ¸Ñ ÑÐ´Ð°Ð»ÐµÐ½Ð°.")
+    await show_menu(event, "\u0410\u043a\u043a\u0430\u0443\u043d\u0442 \u043e\u0442\u043a\u043b\u044e\u0447\u0451\u043d, \u0441\u0435\u0441\u0441\u0438\u044f \u0443\u0434\u0430\u043b\u0435\u043d\u0430.")
 
 
 @bot_client.on(events.CallbackQuery(data=b"sync:start"))
@@ -762,11 +759,11 @@ async def channel_page_handler(event):
     await event.answer()
     state = selections.get(event.sender_id)
     if not state:
-        await show_menu(event, "ÐÑÐ±Ð¾Ñ ÑÑÑÐ°ÑÐµÐ». ÐÐ°ÑÐ½Ð¸ÑÐµ Ð·Ð°Ð½Ð¾Ð²Ð¾.")
+        await show_menu(event, "\u0412\u044b\u0431\u043e\u0440 \u0443\u0441\u0442\u0430\u0440\u0435\u043b. \u041d\u0430\u0447\u043d\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e.")
         return
     phase, page = event.data.decode().split(":")[1:]
     if phase != state.phase:
-        await event.answer("Ð­ÑÐ¾Ñ ÑÐ¿Ð¸ÑÐ¾Ðº ÑÐ¶Ðµ ÑÑÑÐ°ÑÐµÐ»", alert=True)
+        await event.answer("\u042d\u0442\u043e\u0442 \u0441\u043f\u0438\u0441\u043e\u043a \u0443\u0436\u0435 \u0443\u0441\u0442\u0430\u0440\u0435\u043b", alert=True)
         return
     await show_channel_page(event, state, int(page), edit=True)
 
@@ -777,15 +774,15 @@ async def channel_pick_handler(event):
     user_id = event.sender_id
     state = selections.get(user_id)
     if not state:
-        await show_menu(event, "ÐÑÐ±Ð¾Ñ ÑÑÑÐ°ÑÐµÐ». ÐÐ°ÑÐ½Ð¸ÑÐµ Ð·Ð°Ð½Ð¾Ð²Ð¾.")
+        await show_menu(event, "\u0412\u044b\u0431\u043e\u0440 \u0443\u0441\u0442\u0430\u0440\u0435\u043b. \u041d\u0430\u0447\u043d\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e.")
         return
     _, phase, channel_id_text = event.data.decode().split(":")
     if phase != state.phase:
-        await event.answer("Ð­ÑÐ¾Ñ ÑÐ¿Ð¸ÑÐ¾Ðº ÑÐ¶Ðµ ÑÑÑÐ°ÑÐµÐ»", alert=True)
+        await event.answer("\u042d\u0442\u043e\u0442 \u0441\u043f\u0438\u0441\u043e\u043a \u0443\u0436\u0435 \u0443\u0441\u0442\u0430\u0440\u0435\u043b", alert=True)
         return
     channel = state.channels.get(int(channel_id_text))
     if not channel:
-        await event.answer("ÐÐ°Ð½Ð°Ð» Ð½Ðµ Ð½Ð°Ð¹Ð´ÐµÐ½", alert=True)
+        await event.answer("\u041a\u0430\u043d\u0430\u043b \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d", alert=True)
         return
     if phase == "source":
         state.source = channel
@@ -795,7 +792,7 @@ async def channel_pick_handler(event):
     source = state.source
     selections.pop(user_id, None)
     if not source:
-        await show_menu(event, "ÐÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð» Ð½Ðµ Ð²ÑÐ±ÑÐ°Ð½. ÐÐ°ÑÐ½Ð¸ÑÐµ Ð·Ð°Ð½Ð¾Ð²Ð¾.")
+        await show_menu(event, "\u041e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d. \u041d\u0430\u0447\u043d\u0438\u0442\u0435 \u0437\u0430\u043d\u043e\u0432\u043e.")
         return
     await event.edit(
         f"ÐÑÐ±ÑÐ°Ð½Ð¾:\n{source.title} â {channel.title}\n\nÐÐ°ÑÐ¸Ð½Ð°Ñ Ð¿ÐµÑÐµÐ½Ð¾Ñâ¦",
@@ -808,17 +805,17 @@ async def channel_pick_handler(event):
 async def cancel_sync_handler(event):
     await event.answer()
     selections.pop(event.sender_id, None)
-    await event.edit("ÐÑÐ±Ð¾Ñ ÐºÐ°Ð½Ð°Ð»Ð¾Ð² Ð¾ÑÐ¼ÐµÐ½ÑÐ½.", buttons=main_menu(), parse_mode=None)
+    await event.edit("\u0412\u044b\u0431\u043e\u0440 \u043a\u0430\u043d\u0430\u043b\u043e\u0432 \u043e\u0442\u043c\u0435\u043d\u0451\u043d.", buttons=main_menu(), parse_mode=None)
 
 
 @bot_client.on(events.CallbackQuery(data=b"help"))
 async def help_handler(event):
     await event.answer()
     await event.respond(
-        "1. ÐÐ°Ð¶Ð¼Ð¸ÑÐµ Â«ÐÐ¾Ð´ÐºÐ»ÑÑÐ¸ÑÑ Ð°ÐºÐºÐ°ÑÐ½ÑÂ» Ð¸ Ð¾ÑÑÐºÐ°Ð½Ð¸ÑÑÐ¹ÑÐµ QR-ÐºÐ¾Ð´ Ð² Telegram.\n"
-        "2. ÐÐ°Ð¶Ð¼Ð¸ÑÐµ Â«ÐÐµÑÐµÐ½ÐµÑÑÐ¸ Ð¿Ð¾ÑÑÑÂ».\n"
-        "3. ÐÑÐ±ÐµÑÐ¸ÑÐµ Ð¾ÑÐ½Ð¾Ð²Ð½Ð¾Ð¹ ÐºÐ°Ð½Ð°Ð» Ð¸ ÐºÐ°Ð½Ð°Ð» Ð½Ð°Ð·Ð½Ð°ÑÐµÐ½Ð¸Ñ.\n\n"
-        "Ð ÐºÐ°Ð½Ð°Ð»Ðµ Ð½Ð°Ð·Ð½Ð°ÑÐµÐ½Ð¸Ñ Ð°ÐºÐºÐ°ÑÐ½Ñ Ð´Ð¾Ð»Ð¶ÐµÐ½ Ð¸Ð¼ÐµÑÑ Ð¿ÑÐ°Ð²Ð¾ ÑÐµÐ´Ð°ÐºÑÐ¸ÑÐ¾Ð²Ð°ÑÑ Ð¿Ð¾ÑÑÑ.",
+        "1. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u00bb \u0438 \u043e\u0442\u0441\u043a\u0430\u043d\u0438\u0440\u0443\u0439\u0442\u0435 QR-\u043a\u043e\u0434 \u0432 Telegram.\n"
+        "2. \u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u041f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u043f\u043e\u0441\u0442\u044b\u00bb.\n"
+        "3. \u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b \u0438 \u043a\u0430\u043d\u0430\u043b \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f.\n\n"
+        "\u0412 \u043a\u0430\u043d\u0430\u043b\u0435 \u043d\u0430\u0437\u043d\u0430\u0447\u0435\u043d\u0438\u044f \u0430\u043a\u043a\u0430\u0443\u043d\u0442 \u0434\u043e\u043b\u0436\u0435\u043d \u0438\u043c\u0435\u0442\u044c \u043f\u0440\u0430\u0432\u043e \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u0442\u044c \u043f\u043e\u0441\u0442\u044b.",
         buttons=main_menu(), parse_mode=None,
     )
 
@@ -836,11 +833,11 @@ async def noop_handler(event):
 
 async def main():
     if not API_HASH or not BOT_TOKEN:
-        raise RuntimeError("ÐÐµ Ð·Ð°Ð¿Ð¾Ð»Ð½ÐµÐ½Ñ API_HASH Ð¸Ð»Ð¸ BOT_TOKEN")
+        raise RuntimeError("\u041d\u0435 \u0437\u0430\u043f\u043e\u043b\u043d\u0435\u043d\u044b API_HASH \u0438\u043b\u0438 BOT_TOKEN")
     await init_database()
     await bot_client.start(bot_token=BOT_TOKEN)
     me = await bot_client.get_me()
-    log.info("ÐÐ¾Ñ @%s Ð·Ð°Ð¿ÑÑÐµÐ½", me.username)
+    log.info("\u0411\u043e\u0442 @%s \u0437\u0430\u043f\u0443\u0449\u0435\u043d", me.username)
     try:
         await bot_client.run_until_disconnected()
     finally:
@@ -849,7 +846,7 @@ async def main():
         for client in list(user_clients.values()):
             await client.disconnect()
         if database:
-            await database.close()
+            database.close()
 
 
 if __name__ == "__main__":
