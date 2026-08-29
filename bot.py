@@ -7,7 +7,7 @@ import random
 import sqlite3
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,7 +34,7 @@ MAX_DELAY = 3.0
 MAX_REPORT_PART = 3900
 CHANNELS_PER_PAGE = 8
 QR_TIMEOUT = 180
-TEXT_MESSAGE_LIMIT = 4096
+MIN_TARGET_GAP_DAYS = 3
 
 logging.basicConfig(
     level=logging.INFO,
@@ -220,7 +220,7 @@ def main_menu():
     return [
         [Button.inline("\u2795 \u041f\u043e\u0434\u043a\u043b\u044e\u0447\u0438\u0442\u044c \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:add")],
         [Button.inline("\U0001f504 \u041f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u043f\u043e\u0441\u0442\u044b", b"sync:start")],
-        [Button.inline("\U0001f9f9 \u0417\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u043f\u043e\u0441\u0442\u044b \u043d\u0430 \u00ab.\u00bb", b"wipe:start")],
+        [Button.inline("\U0001f9f9 \u0417\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0435 \u043f\u043e\u0441\u0442\u044b \u043d\u0430 \u00ab.\u00bb", b"wipe:start")],
         [
             Button.inline("\U0001f464 \u041c\u043e\u0439 \u0430\u043a\u043a\u0430\u0443\u043d\u0442", b"account:show"),
             Button.inline("\u2699\ufe0f \u041f\u043e\u043c\u043e\u0449\u044c", b"help"),
@@ -347,8 +347,8 @@ def first_photo(messages: list[Message]) -> Message:
     return next((item for item in ordered if item.photo), ordered[0])
 
 
-def has_transferable_media(message: Message) -> bool:
-    return bool(message.photo or message.document)
+def has_photo_or_video(message: Message) -> bool:
+    return bool(message.photo or message.video)
 
 
 async def load_posts(client: TelegramClient, channel) -> list[Post]:
@@ -384,38 +384,21 @@ async def load_posts(client: TelegramClient, channel) -> list[Post]:
     return posts
 
 
-def nearest_unused(source: Post, targets: list[Post], used: set[int]) -> Optional[Post]:
-    available = [item for item in targets if item.message.id not in used]
-    if not available:
-        return None
-    source_day = source.date.date()
-    return min(
-        available,
-        key=lambda item: (
-            abs((item.date.date() - source_day).days),
-            abs((item.date - source.date).total_seconds()),
-            item.message.id,
-        ),
-    )
-
-
-def is_text_target(post: Post) -> bool:
-    media = post.message.media
-    return not media or isinstance(
-        media,
-        (types.MessageMediaWebPage, types.MessageMediaEmpty),
-    )
-
-
-def nearest_unused_text_target(
+def nearest_unused(
     source: Post,
     targets: list[Post],
     used: set[int],
+    used_dates: set[date],
 ) -> Optional[Post]:
     available = [
         item
         for item in targets
-        if item.message.id not in used and is_text_target(item)
+        if item.message.id not in used
+        and not has_photo_or_video(item.message)
+        and all(
+            abs((item.date.date() - used_date).days) >= MIN_TARGET_GAP_DAYS
+            for used_date in used_dates
+        )
     ]
     if not available:
         return None
@@ -428,20 +411,6 @@ def nearest_unused_text_target(
             item.message.id,
         ),
     )
-
-
-def is_caption_limit_error(error: Exception) -> bool:
-    value = f"{type(error).__name__}: {error}".lower().replace("_", "")
-    markers = (
-        "mediacaptiontoolong",
-        "captiontoolong",
-        "messagetoolong",
-        "caption is too long",
-        "message was too long",
-    )
-    return any(marker in value for marker in markers)
-
-
 async def edit_with_flood_retry(client, target_entity, target, source, file):
     kwargs = {
         "entity": target_entity,
@@ -458,36 +427,8 @@ async def edit_with_flood_retry(client, target_entity, target, source, file):
         await client.edit_message(**kwargs)
 
 
-async def replace_post(
-    client,
-    target_entity,
-    target,
-    source,
-    temp_dir: Path,
-    text_only: bool = False,
-):
-    media_file = None
-    downloaded_path: Optional[Path] = None
-    if not text_only and has_transferable_media(source.message):
-        downloaded = await client.download_media(source.message, file=str(temp_dir))
-        if not downloaded:
-            raise RuntimeError("\u043d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0441\u043a\u0430\u0447\u0430\u0442\u044c \u043c\u0435\u0434\u0438\u0430 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u0433\u043e \u043f\u043e\u0441\u0442\u0430")
-        downloaded_path = Path(downloaded)
-        media_file = str(downloaded_path)
-    elif not text_only and source.message.media and not isinstance(
-        source.message.media,
-        (types.MessageMediaWebPage, types.MessageMediaEmpty),
-    ):
-        raise RuntimeError(
-            f"\u0442\u0438\u043f \u043c\u0435\u0434\u0438\u0430 {type(source.message.media).__name__} \u043d\u0435\u043b\u044c\u0437\u044f \u043f\u0435\u0440\u0435\u043d\u0435\u0441\u0442\u0438 \u0440\u0435\u0434\u0430\u043a\u0442\u0438\u0440\u043e\u0432\u0430\u043d\u0438\u0435\u043c"
-        )
-    elif has_transferable_media(target.message):
-        media_file = types.InputMediaEmpty()
-    try:
-        await edit_with_flood_retry(client, target_entity, target, source, media_file)
-    finally:
-        if downloaded_path:
-            downloaded_path.unlink(missing_ok=True)
+async def replace_post(client, target_entity, target, source):
+    await edit_with_flood_retry(client, target_entity, target, source, None)
 
 
 async def run_sync(client, source_channel, target_channel, progress_callback=None):
@@ -507,24 +448,40 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
 
     issues: list[SyncIssue] = []
     used_targets: set[int] = set()
+    used_target_dates: set[date] = set()
     changed = 0
-    with tempfile.TemporaryDirectory(prefix="tg_channel_sync_") as directory:
-        temp_dir = Path(directory)
+    with tempfile.TemporaryDirectory(prefix="tg_channel_sync_"):
         for number, source in enumerate(source_posts, start=1):
-            target = nearest_unused(source, target_posts, used_targets)
+            if not source.text.strip():
+                issues.append(
+                    SyncIssue(
+                        "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415",
+                        source.link,
+                        "\u043d\u0435 \u0432\u044b\u0431\u0440\u0430\u043d",
+                        "\u0432 \u0438\u0441\u0445\u043e\u0434\u043d\u043e\u043c \u043f\u043e\u0441\u0442\u0435 \u043d\u0435\u0442 \u0442\u0435\u043a\u0441\u0442\u0430; \u0444\u043e\u0442\u043e \u0438 \u0432\u0438\u0434\u0435\u043e \u043d\u0435 \u043f\u0435\u0440\u0435\u043d\u043e\u0441\u044f\u0442\u0441\u044f",
+                    )
+                )
+                continue
+            target = nearest_unused(
+                source,
+                target_posts,
+                used_targets,
+                used_target_dates,
+            )
             if target is None:
                 issues.append(
                     SyncIssue(
                         "\u041e\u0428\u0418\u0411\u041a\u0410", source.link, "\u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d",
-                        "\u0432\u043e \u0432\u0442\u043e\u0440\u043e\u043c \u043a\u0430\u043d\u0430\u043b\u0435 \u0437\u0430\u043a\u043e\u043d\u0447\u0438\u043b\u0438\u0441\u044c \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u044b\u0435 \u043f\u043e\u0441\u0442\u044b",
+                        "\u043d\u0435\u0442 \u0441\u0432\u043e\u0431\u043e\u0434\u043d\u043e\u0433\u043e \u043f\u043e\u0441\u0442\u0430 \u0431\u0435\u0437 \u0444\u043e\u0442\u043e/\u0432\u0438\u0434\u0435\u043e, \u0441\u043e\u0431\u043b\u044e\u0434\u0430\u044e\u0449\u0435\u0433\u043e \u0438\u043d\u0442\u0435\u0440\u0432\u0430\u043b \u043d\u0435 \u043c\u0435\u043d\u0435\u0435 3 \u0434\u043d\u0435\u0439",
                     )
                 )
                 continue
             used_targets.add(target.message.id)
             await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
             try:
-                await replace_post(client, target_entity, target, source, temp_dir)
+                await replace_post(client, target_entity, target, source)
                 changed += 1
+                used_target_dates.add(target.date.date())
                 if target.album_size > 1:
                     issues.append(
                         SyncIssue(
@@ -533,46 +490,6 @@ async def run_sync(client, source_channel, target_channel, progress_callback=Non
                         )
                     )
             except Exception as error:
-                can_retry_as_text = (
-                    bool(source.message.photo)
-                    and len(source.text) <= TEXT_MESSAGE_LIMIT
-                    and is_caption_limit_error(error)
-                )
-                if can_retry_as_text:
-                    used_targets.discard(target.message.id)
-                    fallback = nearest_unused_text_target(
-                        source,
-                        target_posts,
-                        used_targets,
-                    )
-                    if fallback:
-                        used_targets.add(fallback.message.id)
-                        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
-                        try:
-                            await replace_post(
-                                client,
-                                target_entity,
-                                fallback,
-                                source,
-                                temp_dir,
-                                text_only=True,
-                            )
-                            changed += 1
-                            issues.append(
-                                SyncIssue(
-                                    "\u041f\u0420\u0415\u0414\u0423\u041f\u0420\u0415\u0416\u0414\u0415\u041d\u0418\u0415",
-                                    source.link,
-                                    fallback.link,
-                                    "\u043f\u043e\u0434\u043f\u0438\u0441\u044c \u043a \u0444\u043e\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u0438 \u043f\u0440\u0435\u0432\u044b\u0441\u0438\u043b\u0430 \u043b\u0438\u043c\u0438\u0442; "
-                                    "\u0442\u0435\u043a\u0441\u0442 \u043f\u0435\u0440\u0435\u043d\u0435\u0441\u0451\u043d \u0432 \u0431\u043b\u0438\u0436\u0430\u0439\u0448\u0438\u0439 \u043f\u043e\u0441\u0442 \u0431\u0435\u0437 \u043c\u0435\u0434\u0438\u0430, "
-                                    "\u0444\u043e\u0442\u043e\u0433\u0440\u0430\u0444\u0438\u044f \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u0430",
-                                )
-                            )
-                            continue
-                        except Exception as fallback_error:
-                            used_targets.discard(fallback.message.id)
-                            error = fallback_error
-                            target = fallback
                 log.exception("\u041d\u0435 \u0443\u0434\u0430\u043b\u043e\u0441\u044c \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c %s -> %s", source.link, target.link)
                 issues.append(
                     SyncIssue(
@@ -676,7 +593,7 @@ def channel_page(state: ChannelSelection, page: int):
     if state.phase == "source":
         action = "\u043e\u0441\u043d\u043e\u0432\u043d\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
     elif state.phase == "wipe":
-        action = "\u043a\u0430\u043d\u0430\u043b \u0434\u043b\u044f \u0437\u0430\u043c\u0435\u043d\u044b \u0432\u0441\u0435\u0445 \u043f\u043e\u0441\u0442\u043e\u0432 \u043d\u0430 \u00ab.\u00bb"
+        action = "\u043a\u0430\u043d\u0430\u043b \u0434\u043b\u044f \u0437\u0430\u043c\u0435\u043d\u044b \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u044b\u0445 \u043f\u043e\u0441\u0442\u043e\u0432 \u043d\u0430 \u00ab.\u00bb"
     else:
         action = "\u0432\u0442\u043e\u0440\u043e\u0439 \u043a\u0430\u043d\u0430\u043b"
     return f"\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 {action}:\n\u270f\ufe0f \u2014 \u043c\u043e\u0436\u043d\u043e \u0438\u0437\u043c\u0435\u043d\u044f\u0442\u044c, \U0001f441 \u2014 \u0442\u043e\u043b\u044c\u043a\u043e \u0447\u0442\u0435\u043d\u0438\u0435", buttons
@@ -776,12 +693,16 @@ async def wipe_channel(event, user_id: int, channel):
         entity = await client.get_entity(channel)
         changed = 0
         skipped = 0
+        skipped_media = 0
         processed = 0
         errors = []
         async for message in client.iter_messages(entity, reverse=True):
             if not is_real_post(message):
                 continue
             processed += 1
+            if has_photo_or_video(message):
+                skipped_media += 1
+                continue
             if (message.message or "") == ".":
                 skipped += 1
                 continue
@@ -805,6 +726,7 @@ async def wipe_channel(event, user_id: int, channel):
             "\u0417\u0430\u043c\u0435\u043d\u0430 \u043f\u043e\u0441\u0442\u043e\u0432 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.",
             f"\u0418\u0437\u043c\u0435\u043d\u0435\u043d\u043e: {changed}",
             f"\u0423\u0436\u0435 \u0431\u044b\u043b\u043e \u00ab.\u00bb: {skipped}",
+            f"\u0421 \u0444\u043e\u0442\u043e \u0438\u043b\u0438 \u0432\u0438\u0434\u0435\u043e \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u043e: {skipped_media}",
             f"\u041e\u0448\u0438\u0431\u043e\u043a: {len(errors)}",
         ]
         for index, (link, details) in enumerate(errors, start=1):
@@ -999,12 +921,12 @@ async def channel_pick_handler(event):
         state.phase = "wipe_confirm"
         await event.edit(
             f"\u041a\u0430\u043d\u0430\u043b: {channel.title}\n\n"
-            "\u0412\u0441\u0435 \u0442\u0435\u043a\u0441\u0442\u044b \u0438 \u043f\u043e\u0434\u043f\u0438\u0441\u0438 \u043f\u043e\u0441\u0442\u043e\u0432 \u0431\u0443\u0434\u0443\u0442 \u0437\u0430\u043c\u0435\u043d\u0435\u043d\u044b \u043d\u0430 \u00ab.\u00bb. "
-            "\u041c\u0435\u0434\u0438\u0430 \u043e\u0441\u0442\u0430\u043d\u0443\u0442\u0441\u044f. \u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043e\u0431\u0440\u0430\u0442\u0438\u043c\u043e.\n\n"
+            "\u0412\u0441\u0435 \u043f\u043e\u0441\u0442\u044b \u0431\u0435\u0437 \u0444\u043e\u0442\u043e \u0438 \u0432\u0438\u0434\u0435\u043e \u0431\u0443\u0434\u0443\u0442 \u0437\u0430\u043c\u0435\u043d\u0435\u043d\u044b \u043d\u0430 \u00ab.\u00bb. "
+            "\u041f\u043e\u0441\u0442\u044b \u0441 \u0444\u043e\u0442\u043e \u0438\u043b\u0438 \u0432\u0438\u0434\u0435\u043e \u0431\u0443\u0434\u0443\u0442 \u043f\u0440\u043e\u043f\u0443\u0449\u0435\u043d\u044b. \u0414\u0435\u0439\u0441\u0442\u0432\u0438\u0435 \u043d\u0435\u043e\u0431\u0440\u0430\u0442\u0438\u043c\u043e.\n\n"
             "\u041f\u0440\u043e\u0434\u043e\u043b\u0436\u0438\u0442\u044c?",
             buttons=[
                 [Button.inline(
-                    "\u0414\u0430, \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u043f\u043e\u0441\u0442\u044b",
+                    "\u0414\u0430, \u0437\u0430\u043c\u0435\u043d\u0438\u0442\u044c \u043f\u043e\u0441\u0442\u044b \u0431\u0435\u0437 \u043c\u0435\u0434\u0438\u0430",
                     f"wipe:confirm:{channel.id}".encode(),
                 )],
                 [Button.inline("\u274c \u041e\u0442\u043c\u0435\u043d\u0430", b"sync:cancel")],
