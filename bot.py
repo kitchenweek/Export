@@ -7,9 +7,9 @@ from pathlib import Path
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import User
 
-API_ID = int(os.environ['TG_API_ID'])
-API_HASH = os.environ['TG_API_HASH']
-BOT_TOKEN = os.environ['BOT_TOKEN']
+API_ID = 32200104
+API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
+BOT_TOKEN = "8723143315:AAFZXrjmQb7Z8Fm6aXPrMUibg_qNT2wU9WA"
 PHONE = os.environ.get('TG_PHONE', '')
 TARGET_GROUP = 'ЧЕКИ МАКСИМ'
 TRIGGER = 'добрый день, ваш заказ прибыл к нам на склад в мск'
