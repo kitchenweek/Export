@@ -18,9 +18,9 @@ from telethon.tl.types import User
 # НАСТРОЙКИ
 # ============================================================
 
-API_ID = 32200104
-API_HASH = "4c657a43a0c2419cd5b18c44d09e68c1"
-BOT_TOKEN = "8723143315:AAFZXrjmQb7Z8Fm6aXPrMUibg_qNT2wU9WA"
+API_ID = 414121
+API_HASH = "db09ccfc2a65e1b14a937be15bdb5d4b"
+BOT_TOKEN = "8968232455:AAFPbx0gCKazqWFBNrnRjF_LHZNt93L7vMw"
 
 TARGET_GROUP = "ЧЕКИ МАКСИМ"
 TRIGGER = "добрый день, ваш заказ прибыл к нам на склад в мск"
