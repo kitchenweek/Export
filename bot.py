@@ -22,6 +22,8 @@ API_ID = 414121
 API_HASH = "db09ccfc2a65e1b14a937be15bdb5d4b"
 BOT_TOKEN = "8968232455:AAFPbx0gCKazqWFBNrnRjF_LHZNt93L7vMw"
 
+ADMIN_ID = 8644736146  # Telegram ID администратора. Измени здесь.
+
 TARGET_GROUP = "ЧЕКИ МАКСИМ"
 TRIGGER = "добрый день, ваш заказ прибыл к нам на склад в мск"
 
@@ -110,7 +112,7 @@ user_client = None
 monitor_handler_installed = False
 login_states = {}
 
-OWNER_ID = None
+OWNER_ID = ADMIN_ID
 
 
 def normalize(text):
@@ -377,19 +379,7 @@ async def disconnect_user(delete_session=True):
 
 @bot.on(events.NewMessage(pattern=r"^/start$"))
 async def start_handler(event):
-    global OWNER_ID
-
-    # Первый пользователь, открывший панель, становится владельцем панели.
-    saved_owner = get_setting("owner_id")
-
-    if saved_owner is None:
-        OWNER_ID = event.sender_id
-        set_setting("owner_id", event.sender_id)
-    else:
-        OWNER_ID = int(saved_owner)
-
-    if event.sender_id != OWNER_ID:
-        await event.respond("⛔ Эта панель принадлежит другому пользователю.")
+    if not event.is_private or event.sender_id != ADMIN_ID:
         return
 
     await event.respond(
@@ -400,14 +390,7 @@ async def start_handler(event):
 
 @bot.on(events.CallbackQuery)
 async def callback_handler(event):
-    global OWNER_ID
-
-    saved_owner = get_setting("owner_id")
-
-    if saved_owner:
-        OWNER_ID = int(saved_owner)
-
-    if OWNER_ID and event.sender_id != OWNER_ID:
+    if not event.is_private or event.sender_id != ADMIN_ID:
         await event.answer("Нет доступа", alert=True)
         return
 
@@ -534,9 +517,7 @@ async def login_messages(event):
     if not event.is_private:
         return
 
-    saved_owner = get_setting("owner_id")
-
-    if saved_owner and event.sender_id != int(saved_owner):
+    if event.sender_id != ADMIN_ID:
         return
 
     state = login_states.get(event.sender_id)
@@ -727,13 +708,7 @@ async def login_messages(event):
 # ============================================================
 
 async def main():
-    global OWNER_ID
-
     db_init()
-
-    saved_owner = get_setting("owner_id")
-    if saved_owner:
-        OWNER_ID = int(saved_owner)
 
     # Бот запускается сразу и НЕ требует input() в консоли.
     await bot.start(bot_token=BOT_TOKEN)
