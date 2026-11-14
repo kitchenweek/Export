@@ -1,6 +1,9 @@
 import asyncio
 import hashlib
+import io
 import sqlite3
+
+import qrcode
 from pathlib import Path
 
 from telethon import TelegramClient, events, Button
@@ -374,6 +377,193 @@ async def disconnect_user(delete_session=True):
 
 
 # ============================================================
+# QR-АВТОРИЗАЦИЯ И ОБЩЕЕ ЗАВЕРШЕНИЕ ВХОДА
+# ============================================================
+
+QR_MAX_AUTO_RENEWALS = 4
+
+
+def qr_keyboard():
+    return [[
+        Button.inline("🔄 Новый QR", b"qr_refresh"),
+        Button.inline("❌ Отмена", b"qr_cancel")
+    ]]
+
+
+async def cancel_login(owner_id):
+    """Закрывает незавершенную авторизацию и ее временное соединение."""
+    state = login_states.pop(owner_id, None)
+    if not state:
+        return
+
+    task = state.get("task")
+    if task and task is not asyncio.current_task() and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    client = state.get("client")
+    if client and client is not user_client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
+
+async def finish_login(owner_id, state):
+    """Проверяет сессию, сохраняет ее и запускает PDF-монитор."""
+    global user_client
+
+    if login_states.get(owner_id) is not state:
+        return
+
+    client = state["client"]
+    if not await client.is_user_authorized():
+        raise RuntimeError("Telegram не подтвердил авторизацию")
+
+    me = await client.get_me()
+    user_client = client
+    await save_current_session()
+    await install_monitor()
+    login_states.pop(owner_id, None)
+
+    await bot.send_message(
+        owner_id,
+        f"✅ Аккаунт подключен.\n\n"
+        f"Имя: {me.first_name or '-'}\n"
+        f"ID: {me.id}\n\n"
+        "Монитор PDF запущен. После перезапуска сессия восстановится автоматически.",
+        buttons=main_keyboard()
+    )
+
+
+async def send_qr_image(owner_id, state, refreshed=False):
+    """Присылает настоящий QR с текущей tg://login-ссылкой."""
+    if login_states.get(owner_id) is not state or state.get("step") != "qr":
+        return
+
+    image = qrcode.make(state["qr"].url, box_size=10, border=4)
+    data = io.BytesIO()
+    image.save(data, format="PNG")
+    data.seek(0)
+    data.name = "telegram_login_qr.png"
+
+    caption = (
+        ("🔄 Новый QR для входа в Telegram.\n\n" if refreshed else
+         "📷 Вход в аккаунт по QR-коду.\n\n")
+        + "1. Открой Telegram на ДРУГОМ устройстве, где уже выполнен вход.\n"
+        + "2. Настройки → Устройства → Подключить устройство.\n"
+        + "3. Отсканируй этот QR-код и подтверди вход.\n\n"
+        + "Бот ожидает подтверждения автоматически. QR действует недолго. "
+          "Если не успел, нажми «Новый QR».\n\n"
+        + "⚠️ Никому не пересылай QR-код: он даёт доступ к аккаунту."
+    )
+    await bot.send_file(owner_id, data, caption=caption, buttons=qr_keyboard())
+
+
+async def wait_qr_login(owner_id, state):
+    """Ожидает сканирования; по истечении срока переиздает QR."""
+    try:
+        while login_states.get(owner_id) is state and state.get("step") == "qr":
+            try:
+                # Telethon QRLogin.wait() ожидает до истечения срока самого токена.
+                await state["qr"].wait()
+            except asyncio.TimeoutError:
+                if login_states.get(owner_id) is not state:
+                    return
+                if state["renewals"] >= QR_MAX_AUTO_RENEWALS:
+                    await bot.send_message(
+                        owner_id,
+                        "⌛ Время ожидания QR истекло. Нажми «Новый QR» "
+                        "для продолжения или «Отмена».",
+                        buttons=qr_keyboard()
+                    )
+                    return
+                state["renewals"] += 1
+                await state["qr"].recreate()
+                await send_qr_image(owner_id, state, refreshed=True)
+                continue
+            except SessionPasswordNeededError:
+                if login_states.get(owner_id) is not state:
+                    return
+                state["step"] = "qr_password"
+                await bot.send_message(
+                    owner_id,
+                    "✅ QR-код подтверждён.\n\n"
+                    "🔐 Включена двухэтапная аутентификация. "
+                    "Отправь пароль 2FA в этот личный чат с ботом. "
+                    "Сообщение с паролем будет удалено после получения.\n\n"
+                    "Для отмены: /cancel"
+                )
+                return
+
+            # QR принят и аккаунт уже авторизован.
+            await finish_login(owner_id, state)
+            return
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        if login_states.get(owner_id) is state:
+            try:
+                await bot.send_message(
+                    owner_id,
+                    f"❌ Ошибка QR-входа: {type(e).__name__}: {e}\n"
+                    "Попробуй подключить аккаунт заново.",
+                    buttons=main_keyboard()
+                )
+            finally:
+                # Не ждём самих себя при отмене ожидающей задачи.
+                await cancel_login(owner_id)
+
+
+async def begin_qr_login(owner_id):
+    """Создает новую временную сессию и запускает прослушивание QR."""
+    await cancel_login(owner_id)
+    client = TelegramClient(StringSession(), API_ID, API_HASH)
+    try:
+        await client.connect()
+        qr = await client.qr_login()
+        state = {
+            "step": "qr", "client": client, "qr": qr,
+            "renewals": 0, "task": None
+        }
+        login_states[owner_id] = state
+        # Задача ожидания запускается сразу, иначе сканирование может не
+        # завершить вход (QRLogin.wait должен уже слушать UpdateLoginToken).
+        state["task"] = asyncio.create_task(wait_qr_login(owner_id, state))
+        await send_qr_image(owner_id, state)
+    except Exception:
+        if login_states.get(owner_id, {}).get("client") is client:
+            await cancel_login(owner_id)
+        else:
+            await client.disconnect()
+        raise
+
+
+async def refresh_qr_login(owner_id):
+    state = login_states.get(owner_id)
+    if not state or state.get("step") != "qr":
+        return False
+
+    task = state.get("task")
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    await state["qr"].recreate()
+    state["renewals"] = 0
+    state["task"] = asyncio.create_task(wait_qr_login(owner_id, state))
+    await send_qr_image(owner_id, state, refreshed=True)
+    return True
+
+
+# ============================================================
 # ПАНЕЛЬ
 # ============================================================
 
@@ -397,20 +587,67 @@ async def callback_handler(event):
     data = event.data
 
     if data == b"connect":
-        if user_client and user_client.is_connected():
+        if user_client and user_client.is_connected() and await user_client.is_user_authorized():
             await event.answer("Аккаунт уже подключен.", alert=True)
             return
 
-        login_states[event.sender_id] = {
-            "step": "phone"
-        }
+        await event.respond(
+            "🔐 Выбери способ подключения Telegram-аккаунта:",
+            buttons=[
+                [Button.inline("📷 Войти по QR-коду", b"connect_qr")],
+                [Button.inline("📱 Войти по номеру", b"connect_phone")],
+                [Button.inline("❌ Отмена", b"qr_cancel")]
+            ]
+        )
+        await event.answer()
+        return
 
+    if data == b"connect_phone":
+        if user_client and user_client.is_connected() and await user_client.is_user_authorized():
+            await event.answer("Аккаунт уже подключен.", alert=True)
+            return
+        await cancel_login(event.sender_id)
+        login_states[event.sender_id] = {"step": "phone"}
         await event.respond(
             "📱 Отправь номер телефона аккаунта Telegram.\n\n"
-            "Пример:\n+79991234567\n\n"
+            "Пример: +79991234567\n\n"
             "Для отмены: /cancel"
         )
         await event.answer()
+        return
+
+    if data == b"connect_qr":
+        if user_client and user_client.is_connected() and await user_client.is_user_authorized():
+            await event.answer("Аккаунт уже подключен.", alert=True)
+            return
+        await event.answer("Создаю QR-код…")
+        try:
+            await begin_qr_login(event.sender_id)
+        except Exception as e:
+            await event.respond(
+                f"❌ Не удалось создать QR: {type(e).__name__}: {e}",
+                buttons=main_keyboard()
+            )
+        return
+
+    if data == b"qr_refresh":
+        await event.answer("Обновляю QR-код…")
+        try:
+            if not await refresh_qr_login(event.sender_id):
+                await event.respond(
+                    "Нет активного QR-входа. Нажми «Подключить аккаунт».",
+                    buttons=main_keyboard()
+                )
+        except Exception as e:
+            await event.respond(
+                f"❌ Ошибка обновления QR: {type(e).__name__}: {e}"
+            )
+        return
+
+    if data == b"qr_cancel":
+        await cancel_login(event.sender_id)
+        await event.answer("Авторизация отменена.")
+        await event.respond("Авторизация отменена.", buttons=main_keyboard())
         return
 
     if data == b"status":
@@ -528,19 +765,16 @@ async def login_messages(event):
     text = (event.raw_text or "").strip()
 
     if text == "/cancel":
-        client = state.get("client")
+        await cancel_login(event.sender_id)
+        await event.respond("Авторизация отменена.", buttons=main_keyboard())
+        return
 
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-
-        login_states.pop(event.sender_id, None)
-
+    if state["step"] == "qr":
         await event.respond(
-            "Авторизация отменена.",
-            buttons=main_keyboard()
+            "📷 Сейчас ожидается сканирование QR-кода. "
+            "Отсканируй его в Telegram на другом устройстве или нажми «Новый QR».\n"
+            "Для отмены: /cancel",
+            buttons=qr_keyboard()
         )
         return
 
@@ -613,22 +847,7 @@ async def login_messages(event):
                 phone_code_hash=state["phone_code_hash"]
             )
 
-            user_client = client
-
-            await save_current_session()
-            await install_monitor()
-
-            login_states.pop(event.sender_id, None)
-
-            me = await user_client.get_me()
-
-            await event.respond(
-                f"✅ Аккаунт подключен.\n\n"
-                f"Имя: {me.first_name or '-'}\n"
-                f"ID: {me.id}\n\n"
-                f"Монитор PDF запущен.",
-                buttons=main_keyboard()
-            )
+            await finish_login(event.sender_id, state)
 
         except SessionPasswordNeededError:
             state["step"] = "password"
@@ -666,28 +885,19 @@ async def login_messages(event):
         return
 
     # ШАГ 3 — 2FA
-    if state["step"] == "password":
+    if state["step"] in ("password", "qr_password"):
         client = state["client"]
+
+        # По возможности не оставляем пароль 2FA в истории личного чата.
+        try:
+            await event.delete()
+        except Exception:
+            pass
 
         try:
             await client.sign_in(password=text)
 
-            user_client = client
-
-            await save_current_session()
-            await install_monitor()
-
-            login_states.pop(event.sender_id, None)
-
-            me = await user_client.get_me()
-
-            await event.respond(
-                f"✅ Аккаунт подключен.\n\n"
-                f"Имя: {me.first_name or '-'}\n"
-                f"ID: {me.id}\n\n"
-                f"Монитор PDF запущен.",
-                buttons=main_keyboard()
-            )
+            await finish_login(event.sender_id, state)
 
         except PasswordHashInvalidError:
             await event.respond(
