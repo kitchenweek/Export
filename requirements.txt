@@ -1,1 +1,2 @@
 Telethon>=1.40,<2
+qrcode[pil]>=8.0,<9
