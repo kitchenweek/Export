@@ -25,7 +25,7 @@ API_ID = 414121
 API_HASH = "db09ccfc2a65e1b14a937be15bdb5d4b"
 BOT_TOKEN = "8587715287:AAFfFjBjQXxesOTuPiolYu01ZF4KWwWblaY"
 
-ADMIN_ID = 617763766  # Telegram ID администратора. Измени здесь.
+ADMIN_ID = 6500453044  # Telegram ID администратора. Измени здесь.
 
 TARGET_GROUP = "ЧЕКИ МАКСИМ"
 TRIGGER = "добрый день, ваш заказ прибыл к нам на склад в мск"
